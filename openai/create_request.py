@@ -11,9 +11,14 @@ collection = db["jtrl"]
 
 print("Fetching MongoDB documents...")
 documents = list(collection.aggregate([
-    {"$match": {"Decisão Texto Integral": {"$exists": True}}},
+    {"$match": {
+        "Decisão Texto Integral": {"$exists": True},
+        "results": {"$exists": False},
+        "wrong": {"$exists": False}
+    }},
     {"$sample": {"size": 20}}
 ]))
+
 
 load_dotenv()
 
