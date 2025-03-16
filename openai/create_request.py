@@ -7,18 +7,17 @@ from pymongo import MongoClient
 
 client = MongoClient("mongodb://localhost:27017/")
 db = client["files"]
-collection = db["jtrl"]
+collection = db["stj"]
 
 print("Fetching MongoDB documents...")
 documents = list(collection.aggregate([
     {"$match": {
-        "Decisão Texto Integral": {"$exists": True},
+        "Texto Integral": {"$exists": True, "$ne": ""},
         "results": {"$exists": False},
         "wrong": {"$exists": False}
     }},
-    {"$sample": {"size": 20}}
+    {"$sample": {"size": 50}}
 ]))
-
 
 load_dotenv()
 
@@ -28,14 +27,14 @@ prompt = os.getenv('OPENAI_PROMPT')
 batch_requests = []
 
 for doc in documents:
-    doc_decision = doc["Decisão Texto Integral"]
+    doc_decision = doc["Texto Integral"]
     if doc_decision:
         batch_requests.append({
             "custom_id": "request-" + str(doc["_id"]),
             "method": "POST",
             "url": "/v1/chat/completions",
             "body": {
-                "model": "gpt-4o",
+                "model": "gpt-4o-mini",
                 "messages": [
                     {
                         "role": "system",

@@ -4,10 +4,6 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer
 
 
-def fetch_documents(collection, document_id):
-    return list(collection.find({'_id': {'$ne': document_id}}))
-
-
 def get_embedding(model: SentenceTransformer, documents: any, collection, embeddings: list[any]):
     batch = []
     ids = []
@@ -17,10 +13,10 @@ def get_embedding(model: SentenceTransformer, documents: any, collection, embedd
             embeddings.append(doc["embedding"])
             continue
 
-        if "Decisão Texto Integral" not in doc:
+        if "Texto Integral" not in doc:
             continue
 
-        batch.append(doc["Decisão Texto Integral"])
+        batch.append(doc["Texto Integral"])
         ids.append(doc["_id"])
 
         if (i + 1) % 100 == 0:
@@ -43,20 +39,18 @@ def get_embedding(model: SentenceTransformer, documents: any, collection, embedd
     return embeddings
 
 
-def embed(document):
+def embed(document, all_documents):
     client = MongoClient("mongodb://localhost:27017/")
     db = client["files"]
-    collection = db["jtrl"]
+    collection = db["stj"]
 
     document_id = document["_id"]
-    print("Fetching all documents...")
-    all_documents = fetch_documents(collection, document_id)
 
     print("Embedding documents...")
     model = SentenceTransformer("paraphrase-mpnet-base-v2")
 
     if "embedding" not in document:
-        target_embedding = model.encode([document["Decisão Texto Integral"]])[0]
+        target_embedding = model.encode([document["Texto Integral"]])[0]
         collection.update_one({"_id": document_id}, {"$set": {"embedding": target_embedding.tolist()}})
     else:
         target_embedding = np.array(document["embedding"])
