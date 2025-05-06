@@ -12,6 +12,7 @@ from torch.utils.data.distributed import DistributedSampler
 from transformers import AutoTokenizer
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.amp import autocast, GradScaler
+from torch.utils.tensorboard import SummaryWriter
 from crawler.dgsi.helpers import connect
 from encoder.dataset_processor import DatasetProcessor
 from encoder.triplet_loss import TripletLoss
@@ -72,7 +73,7 @@ def train_distributed(rank, world_size, num_epochs=10):
 
     log_memory_usage(rank, "[Before model loading]")
 
-    model_name = "PORTULAN/albertina-100m-portuguese-ptpt-encoder"
+    model_name = "PORTULAN/albertina-1b5-portuguese-ptpt-encoder"
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = EncoderWrapper(model_name=model_name).to(rank)
 
@@ -116,7 +117,7 @@ def train_single_gpu(num_epochs=10):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log_memory_usage(device, "[Before model loading]")
 
-    model_name = "PORTULAN/albertina-100m-portuguese-ptpt-encoder"
+    model_name = "PORTULAN/albertina-1b5-portuguese-ptpt-encoder"
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = EncoderWrapper(model_name=model_name).to(device)
 
@@ -163,6 +164,7 @@ def run_training_loop(rank, world_size, model, tokenizer, train_loader, test_loa
     accumulation_steps = 4
 
     is_main_process = (rank == 0 or world_size == 1)
+    writer = SummaryWriter(log_dir="./runs/albertina_triplet") if is_main_process else None
 
     logger.info(f"[RANK {device}] Starting training for {num_epochs} epochs...")
 
@@ -178,7 +180,6 @@ def run_training_loop(rank, world_size, model, tokenizer, train_loader, test_loa
         optimizer.zero_grad()
 
         for i, batch in enumerate(progress_bar):
-            # Move inputs to device
             anchor_inputs = {k: v.to(device) for k, v in batch['anchor'].items()}
             positive_inputs = {k: v.to(device) for k, v in batch['positive'].items()}
             negative_inputs = {k: v.to(device) for k, v in batch['negative'].items()}
@@ -229,6 +230,9 @@ def run_training_loop(rank, world_size, model, tokenizer, train_loader, test_loa
             optimizer.zero_grad()
 
         avg_train_loss = running_loss / len(train_loader)
+        if writer:
+            writer.add_scalar("Loss/Train", avg_train_loss, epoch)
+
         if is_main_process:
             logger.info(f"Epoch {epoch + 1}/{num_epochs}, Train Avg Loss: {avg_train_loss:.4f}")
 
@@ -249,7 +253,10 @@ def run_training_loop(rank, world_size, model, tokenizer, train_loader, test_loa
                         loss = criterion(anchor_embeddings, positive_embeddings, negative_embeddings)
                         test_loss += loss.item()
 
-                logger.info(f"Epoch {epoch + 1}/{num_epochs}, Test Avg Loss: {test_loss / len(test_loader):.4f}")
+                avg_test_loss = test_loss / len(test_loader)
+                logger.info(f"Epoch {epoch + 1}/{num_epochs}, Test Avg Loss: {avg_test_loss:.4f}")
+                if writer:
+                    writer.add_scalar("Loss/Test", avg_test_loss, epoch)
 
         empty_cache()
         log_memory_usage(device, f"[End of Epoch {epoch + 1}]")
@@ -261,6 +268,9 @@ def run_training_loop(rank, world_size, model, tokenizer, train_loader, test_loa
         model_to_save.save_pretrained("./finetuned-albertina-triplet-loss")
         tokenizer.save_pretrained("./finetuned-albertina-triplet-loss")
         logger.info("Model and tokenizer saved successfully to ./finetuned-albertina-triplet-loss")
+
+    if writer:
+        writer.close()
 
 
 def main():
