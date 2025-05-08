@@ -86,7 +86,7 @@ def train_distributed(rank, world_size, num_epochs=10):
     logger.info(f"[RANK {rank}] Model loaded and wrapped in DDP.")
     log_memory_usage(rank, "[After model loading]")
 
-    train_dataset = DatasetProcessor(collection=collection, tokenizer=tokenizer, split="train", max_samples=100)
+    train_dataset = DatasetProcessor(collection=collection, tokenizer=tokenizer, split="train")
     train_sampler = DistributedSampler(dataset=train_dataset, num_replicas=world_size, rank=rank)
     train_loader = DataLoader(
         dataset=train_dataset,
@@ -98,7 +98,7 @@ def train_distributed(rank, world_size, num_epochs=10):
 
     test_loader = None
     if rank == 0:
-        test_dataset = DatasetProcessor(collection=collection, tokenizer=tokenizer, split="test", max_samples=100)
+        test_dataset = DatasetProcessor(collection=collection, tokenizer=tokenizer, split="test")
         test_loader = DataLoader(
             dataset=test_dataset,
             batch_size=1,
@@ -128,7 +128,7 @@ def train_single_gpu(num_epochs=10):
     logger.info("Model loaded for single-GPU training.")
     log_memory_usage(device, "[After model loading]")
 
-    train_dataset = DatasetProcessor(collection=collection, tokenizer=tokenizer, split="train", max_samples=100)
+    train_dataset = DatasetProcessor(collection=collection, tokenizer=tokenizer, split="train")
     train_loader = DataLoader(
         dataset=train_dataset,
         batch_size=1,
@@ -137,7 +137,7 @@ def train_single_gpu(num_epochs=10):
         num_workers=0
     )
 
-    test_dataset = DatasetProcessor(collection=collection, tokenizer=tokenizer, split="test", max_samples=100)
+    test_dataset = DatasetProcessor(collection=collection, tokenizer=tokenizer, split="test")
     test_loader = DataLoader(
         dataset=test_dataset,
         batch_size=1,
