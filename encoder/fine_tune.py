@@ -65,28 +65,50 @@ def cleanup():
     logger.info("Cleaned up distributed process group.")
 
 
+def load_latest_checkpoint(model, tokenizer, checkpoint_dir, device):
+    last_epoch = -1
+    if os.path.isdir(checkpoint_dir):
+        checkpoints = [d for d in os.listdir(checkpoint_dir) if d.startswith("epoch_")]
+        if checkpoints:
+            last_epoch = max([int(d.split("_")[1]) for d in checkpoints])
+            latest_checkpoint = os.path.join(checkpoint_dir, f"epoch_{last_epoch}")
+            model.encoder = model.encoder.from_pretrained(latest_checkpoint).to(device)
+            tokenizer = tokenizer.from_pretrained(latest_checkpoint)
+    return model, tokenizer, last_epoch + 1
+
+
+def save_checkpoint(model, tokenizer, epoch, checkpoint_dir):
+    save_path = os.path.join(checkpoint_dir, f"epoch_{epoch}")
+    if not os.path.exists(save_path):
+        os.makedirs(save_path)
+    model_to_save = model.module.encoder if hasattr(model, "module") else model.encoder
+    model_to_save.save_pretrained(save_path)
+    tokenizer.save_pretrained(save_path)
+    logger.info(f"Checkpoint saved at {save_path}")
+
+
 def train_distributed(rank, world_size, num_epochs=10):
     backend = 'nccl' if platform.system() != 'Windows' else 'gloo'
     setup(rank, world_size, backend=backend)
 
     collection = connect().database.encoder
-
+    checkpoint_dir = "./checkpoints"
     log_memory_usage(rank, "[Before model loading]")
 
-    model_name = "PORTULAN/albertina-1b5-portuguese-ptpt-encoder"
+    model_name = "PORTULAN/albertina-100m-portuguese-ptpt-encoder"
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = EncoderWrapper(model_name=model_name).to(rank)
+    model, tokenizer, start_epoch = load_latest_checkpoint(model, tokenizer, checkpoint_dir, rank)
 
     if hasattr(model.encoder, "gradient_checkpointing_enable"):
         model.encoder.gradient_checkpointing_enable()
         logger.info(f"[RANK {rank}] Gradient checkpointing enabled")
 
     model = DDP(model, device_ids=[rank])
-
     logger.info(f"[RANK {rank}] Model loaded and wrapped in DDP.")
     log_memory_usage(rank, "[After model loading]")
 
-    train_dataset = DatasetProcessor(collection=collection, tokenizer=tokenizer, split="train")
+    train_dataset = DatasetProcessor(collection=collection, tokenizer=tokenizer, split="train", max_samples=100)
     train_sampler = DistributedSampler(dataset=train_dataset, num_replicas=world_size, rank=rank)
     train_loader = DataLoader(
         dataset=train_dataset,
@@ -98,7 +120,7 @@ def train_distributed(rank, world_size, num_epochs=10):
 
     test_loader = None
     if rank == 0:
-        test_dataset = DatasetProcessor(collection=collection, tokenizer=tokenizer, split="test")
+        test_dataset = DatasetProcessor(collection=collection, tokenizer=tokenizer, split="test", max_samples=100)
         test_loader = DataLoader(
             dataset=test_dataset,
             batch_size=1,
@@ -107,19 +129,21 @@ def train_distributed(rank, world_size, num_epochs=10):
             num_workers=0
         )
 
-    run_training_loop(rank, world_size, model, tokenizer, train_loader, test_loader, train_sampler, num_epochs)
+    run_training_loop(rank, world_size, model, tokenizer, train_loader, test_loader, train_sampler, num_epochs,
+                      start_epoch, checkpoint_dir)
     cleanup()
 
 
 def train_single_gpu(num_epochs=10):
     collection = connect().database.encoder
-
+    checkpoint_dir = "./checkpoints"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log_memory_usage(device, "[Before model loading]")
 
-    model_name = "PORTULAN/albertina-1b5-portuguese-ptpt-encoder"
+    model_name = "PORTULAN/albertina-100m-portuguese-ptpt-encoder"
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = EncoderWrapper(model_name=model_name).to(device)
+    model, tokenizer, start_epoch = load_latest_checkpoint(model, tokenizer, checkpoint_dir, device)
 
     if hasattr(model.encoder, "gradient_checkpointing_enable"):
         model.encoder.gradient_checkpointing_enable()
@@ -128,7 +152,7 @@ def train_single_gpu(num_epochs=10):
     logger.info("Model loaded for single-GPU training.")
     log_memory_usage(device, "[After model loading]")
 
-    train_dataset = DatasetProcessor(collection=collection, tokenizer=tokenizer, split="train")
+    train_dataset = DatasetProcessor(collection=collection, tokenizer=tokenizer, split="train", max_samples=100)
     train_loader = DataLoader(
         dataset=train_dataset,
         batch_size=1,
@@ -137,7 +161,7 @@ def train_single_gpu(num_epochs=10):
         num_workers=0
     )
 
-    test_dataset = DatasetProcessor(collection=collection, tokenizer=tokenizer, split="test")
+    test_dataset = DatasetProcessor(collection=collection, tokenizer=tokenizer, split="test", max_samples=100)
     test_loader = DataLoader(
         dataset=test_dataset,
         batch_size=1,
@@ -146,29 +170,28 @@ def train_single_gpu(num_epochs=10):
         num_workers=0
     )
 
-    run_training_loop(device, 1, model, tokenizer, train_loader, test_loader, None, num_epochs)
+    run_training_loop(device, 1, model, tokenizer, train_loader, test_loader, None, num_epochs,
+                      start_epoch, checkpoint_dir)
 
 
-def run_training_loop(rank, world_size, model, tokenizer, train_loader, test_loader, train_sampler, num_epochs):
-    device = rank if isinstance(rank, torch.device) else torch.device(
-        f'cuda:{rank}' if torch.cuda.is_available() else 'cpu')
+def run_training_loop(rank, world_size, model, tokenizer, train_loader, test_loader, train_sampler, num_epochs,
+                      start_epoch, checkpoint_dir):
+    device = rank if isinstance(rank, torch.device) else torch.device(f'cuda:{rank}' if torch.cuda.is_available()
+                                                                      else 'cpu')
     model = model.to(device)
     log_memory_usage(device, "[Start of training]")
 
     criterion = TripletLoss(margin=1.0)
     optimizer = optim.AdamW(model.parameters(), lr=2e-5)
-
     use_fp16 = False
     scaler = GradScaler() if torch.cuda.is_available() and use_fp16 else None
-
     accumulation_steps = 4
-
     is_main_process = (rank == 0 or world_size == 1)
     writer = SummaryWriter(log_dir="./runs/albertina_triplet") if is_main_process else None
 
-    logger.info(f"[RANK {device}] Starting training for {num_epochs} epochs...")
+    logger.info(f"[RANK {device}] Starting training from epoch {start_epoch} to {num_epochs}...")
 
-    for epoch in range(num_epochs):
+    for epoch in range(start_epoch, num_epochs):
         model.train()
         running_loss = 0.0
 
@@ -176,7 +199,6 @@ def run_training_loop(rank, world_size, model, tokenizer, train_loader, test_loa
             train_sampler.set_epoch(epoch)
 
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs}") if is_main_process else train_loader
-
         optimizer.zero_grad()
 
         for i, batch in enumerate(progress_bar):
@@ -189,11 +211,8 @@ def run_training_loop(rank, world_size, model, tokenizer, train_loader, test_loa
                     anchor_embeddings = model(anchor_inputs['input_ids'], anchor_inputs['attention_mask'])
                     positive_embeddings = model(positive_inputs['input_ids'], positive_inputs['attention_mask'])
                     negative_embeddings = model(negative_inputs['input_ids'], negative_inputs['attention_mask'])
-                    loss = criterion(anchor_embeddings, positive_embeddings, negative_embeddings)
-                    loss = loss / accumulation_steps
-
+                    loss = criterion(anchor_embeddings, positive_embeddings, negative_embeddings) / accumulation_steps
                 scaler.scale(loss).backward()
-
                 if (i + 1) % accumulation_steps == 0:
                     scaler.step(optimizer)
                     scaler.update()
@@ -202,12 +221,8 @@ def run_training_loop(rank, world_size, model, tokenizer, train_loader, test_loa
                 anchor_embeddings = model(anchor_inputs['input_ids'], anchor_inputs['attention_mask'])
                 positive_embeddings = model(positive_inputs['input_ids'], positive_inputs['attention_mask'])
                 negative_embeddings = model(negative_inputs['input_ids'], negative_inputs['attention_mask'])
-
-                loss = criterion(anchor_embeddings, positive_embeddings, negative_embeddings)
-                loss = loss / accumulation_steps
-
+                loss = criterion(anchor_embeddings, positive_embeddings, negative_embeddings) / accumulation_steps
                 loss.backward()
-
                 if (i + 1) % accumulation_steps == 0:
                     optimizer.step()
                     optimizer.zero_grad()
@@ -215,8 +230,8 @@ def run_training_loop(rank, world_size, model, tokenizer, train_loader, test_loa
             running_loss += loss.item() * accumulation_steps
 
             if is_main_process and isinstance(progress_bar, tqdm):
-                progress_bar.set_description(
-                    f"Epoch {epoch + 1}/{num_epochs}, Loss: {loss.item() * accumulation_steps:.4f}")
+                progress_bar.set_description(f"Epoch {epoch + 1}/{num_epochs}, "
+                                             f"Loss: {loss.item() * accumulation_steps:.4f}")
 
             if (i + 1) % 20 == 0:
                 log_memory_usage(device, f"[Epoch {epoch + 1}, Batch {i + 1}]")
@@ -249,7 +264,6 @@ def run_training_loop(rank, world_size, model, tokenizer, train_loader, test_loa
                         anchor_embeddings = model(anchor_inputs['input_ids'], anchor_inputs['attention_mask'])
                         positive_embeddings = model(positive_inputs['input_ids'], positive_inputs['attention_mask'])
                         negative_embeddings = model(negative_inputs['input_ids'], negative_inputs['attention_mask'])
-
                         loss = criterion(anchor_embeddings, positive_embeddings, negative_embeddings)
                         test_loss += loss.item()
 
@@ -258,12 +272,15 @@ def run_training_loop(rank, world_size, model, tokenizer, train_loader, test_loa
                 if writer:
                     writer.add_scalar("Loss/Test", avg_test_loss, epoch)
 
+        if (epoch + 1) % 1 == 0:
+            if is_main_process:
+                save_checkpoint(model, tokenizer, epoch + 1, checkpoint_dir)
+
         empty_cache()
         log_memory_usage(device, f"[End of Epoch {epoch + 1}]")
 
     if is_main_process:
         log_memory_usage(device, "[Before saving model]")
-
         model_to_save = model.module.encoder if hasattr(model, "module") else model.encoder
         model_to_save.save_pretrained("./finetuned-albertina-triplet-loss")
         tokenizer.save_pretrained("./finetuned-albertina-triplet-loss")
