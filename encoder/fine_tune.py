@@ -13,10 +13,9 @@ from transformers import AutoTokenizer
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.amp import autocast, GradScaler
 from torch.utils.tensorboard import SummaryWriter
-from crawler.dgsi.helpers import connect
-from encoder.dataset_processor import DatasetProcessor
-from encoder.triplet_loss import TripletLoss
-from encoder.wrapper import EncoderWrapper
+from dataset_processor import DatasetProcessor
+from triplet_loss import TripletLoss
+from wrapper import EncoderWrapper
 from tqdm import tqdm
 
 
@@ -91,7 +90,6 @@ def train_distributed(rank, world_size, num_epochs=10):
     backend = 'nccl' if platform.system() != 'Windows' else 'gloo'
     setup(rank, world_size, backend=backend)
 
-    collection = connect().database.encoder
     checkpoint_dir = "./checkpoints"
     log_memory_usage(rank, "[Before model loading]")
 
@@ -108,7 +106,7 @@ def train_distributed(rank, world_size, num_epochs=10):
     logger.info(f"[RANK {rank}] Model loaded and wrapped in DDP.")
     log_memory_usage(rank, "[After model loading]")
 
-    train_dataset = DatasetProcessor(collection=collection, tokenizer=tokenizer, split="train", max_samples=100)
+    train_dataset = DatasetProcessor(tokenizer=tokenizer, split="train", max_samples=100)
     train_sampler = DistributedSampler(dataset=train_dataset, num_replicas=world_size, rank=rank)
     train_loader = DataLoader(
         dataset=train_dataset,
@@ -120,7 +118,7 @@ def train_distributed(rank, world_size, num_epochs=10):
 
     test_loader = None
     if rank == 0:
-        test_dataset = DatasetProcessor(collection=collection, tokenizer=tokenizer, split="test", max_samples=100)
+        test_dataset = DatasetProcessor(tokenizer=tokenizer, split="test", max_samples=100)
         test_loader = DataLoader(
             dataset=test_dataset,
             batch_size=1,
@@ -135,7 +133,6 @@ def train_distributed(rank, world_size, num_epochs=10):
 
 
 def train_single_gpu(num_epochs=10):
-    collection = connect().database.encoder
     checkpoint_dir = "./checkpoints"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log_memory_usage(device, "[Before model loading]")
@@ -152,7 +149,7 @@ def train_single_gpu(num_epochs=10):
     logger.info("Model loaded for single-GPU training.")
     log_memory_usage(device, "[After model loading]")
 
-    train_dataset = DatasetProcessor(collection=collection, tokenizer=tokenizer, split="train", max_samples=100)
+    train_dataset = DatasetProcessor(tokenizer=tokenizer, split="train", max_samples=100)
     train_loader = DataLoader(
         dataset=train_dataset,
         batch_size=1,
@@ -161,7 +158,7 @@ def train_single_gpu(num_epochs=10):
         num_workers=0
     )
 
-    test_dataset = DatasetProcessor(collection=collection, tokenizer=tokenizer, split="test", max_samples=100)
+    test_dataset = DatasetProcessor(tokenizer=tokenizer, split="test", max_samples=100)
     test_loader = DataLoader(
         dataset=test_dataset,
         batch_size=1,
@@ -272,7 +269,7 @@ def run_training_loop(rank, world_size, model, tokenizer, train_loader, test_loa
                 if writer:
                     writer.add_scalar("Loss/Test", avg_test_loss, epoch)
 
-        if (epoch + 1) % 1 == 0:
+        if (epoch + 1) % 10 == 0:
             if is_main_process:
                 save_checkpoint(model, tokenizer, epoch + 1, checkpoint_dir)
 

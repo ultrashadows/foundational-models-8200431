@@ -1,34 +1,41 @@
 import random
 import logging
+import json
 from torch.utils.data import Dataset
 
 logger = logging.getLogger(__name__)
 
 
 class DatasetProcessor(Dataset):
-    def __init__(self, collection, tokenizer, max_length=1024, split="train", train_ratio=0.8, max_samples=None,
-                 seed=42):
+    def __init__(self, tokenizer, max_length=1024, split="train", train_ratio=0.8, max_samples=None,
+                 seed=42, json_path="dataset.json"):
         logger.info(f"Initializing DatasetProcessor with split='{split}', max_samples={max_samples}")
-        self.collection = collection
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.data = list(self.collection.find({}))
+
+        with open(json_path, 'r', encoding='utf-8') as f:
+            self.data = json.load(f)
+
+        def extract_id(value):
+            if isinstance(value, dict) and '$oid' in value:
+                return value['$oid']
+            return str(value)
+
+        doc_map = {extract_id(doc['_id']): doc for doc in self.data}
         all_samples = []
 
         for doc in self.data:
             if 'results' in doc and isinstance(doc['results'], list) and doc.get('wrong'):
                 correct_doc_text = doc.get('Texto Integral', '')
-
                 if not correct_doc_text:
                     continue
 
-                wrong_doc = self.collection.find_one({'_id': doc['wrong']})
-
+                wrong_id = extract_id(doc['wrong'])
+                wrong_doc = doc_map.get(wrong_id)
                 if not wrong_doc:
                     continue
 
                 wrong_doc_text = wrong_doc.get('Texto Integral', '')
-
                 if not wrong_doc_text:
                     continue
 
