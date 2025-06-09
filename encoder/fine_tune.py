@@ -93,7 +93,7 @@ def train_distributed(rank, world_size, num_epochs=10):
     checkpoint_dir = "./checkpoints"
     log_memory_usage(rank, "[Before model loading]")
 
-    model_name = "PORTULAN/albertina-100m-portuguese-ptpt-encoder"
+    model_name = "./models/albertina-100m"
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = EncoderWrapper(model_name=model_name).to(rank)
     model, tokenizer, start_epoch = load_latest_checkpoint(model, tokenizer, checkpoint_dir, rank)
@@ -137,7 +137,7 @@ def train_single_gpu(num_epochs=10):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log_memory_usage(device, "[Before model loading]")
 
-    model_name = "PORTULAN/albertina-100m-portuguese-ptpt-encoder"
+    model_name = "./models/albertina-100m"
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = EncoderWrapper(model_name=model_name).to(device)
     model, tokenizer, start_epoch = load_latest_checkpoint(model, tokenizer, checkpoint_dir, device)
@@ -279,9 +279,9 @@ def run_training_loop(rank, world_size, model, tokenizer, train_loader, test_loa
     if is_main_process:
         log_memory_usage(device, "[Before saving model]")
         model_to_save = model.module.encoder if hasattr(model, "module") else model.encoder
-        model_to_save.save_pretrained("./finetuned-albertina-triplet-loss")
-        tokenizer.save_pretrained("./finetuned-albertina-triplet-loss")
-        logger.info("Model and tokenizer saved successfully to ./finetuned-albertina-triplet-loss")
+        model_to_save.save_pretrained("./finetuned-albertina-1b5-triplet-loss")
+        tokenizer.save_pretrained("./finetuned-albertina-1b5-triplet-loss")
+        logger.info("Model and tokenizer saved successfully to ./finetuned-albertina-1b5-triplet-loss")
 
     if writer:
         writer.close()

@@ -3,7 +3,7 @@ from transformers import AutoModel
 
 
 class EncoderWrapper(nn.Module):
-    def __init__(self, model_name='PORTULAN/albertina-1b5-portuguese-ptpt-encoder'):
+    def __init__(self, model_name='./models/albertina-1b5'):
         super(EncoderWrapper, self).__init__()
         self.encoder = AutoModel.from_pretrained(model_name)
 
