@@ -1,14 +1,10 @@
 import random
 import logging
 import json
-import pickle
 import os
-import hashlib
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 from torch.utils.data import Dataset
 import torch
-from concurrent.futures import ThreadPoolExecutor
-import multiprocessing as mp
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -17,31 +13,13 @@ logger = logging.getLogger(__name__)
 
 class DatasetProcessor(Dataset):
     def __init__(self, tokenizer, max_length=512, split="train", train_ratio=0.8, max_samples=None,
-                 seed=42, json_path="dataset.json", cache_dir="./cache"):
+                 seed=42, json_path="dataset.json"):
         logger.info(f"Initializing DatasetProcessor with split='{split}', max_samples={max_samples}")
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.cache_dir = cache_dir
-        os.makedirs(cache_dir, exist_ok=True)
 
-        tokenizer_hash = hashlib.md5(str(tokenizer).encode()).hexdigest()[:8]
-        cache_filename = f"dataset_cache_{split}_{max_length}_{max_samples or 'all'}_{seed}_{tokenizer_hash}.pkl"
-        cache_path = os.path.join(cache_dir, cache_filename)
-
-        if os.path.exists(cache_path):
-            logger.info(f"Loading dataset from cache: {cache_path}")
-            with open(cache_path, 'rb') as f:
-                self.samples = pickle.load(f)
-            logger.info(f"Loaded {len(self.samples)} samples from cache")
-        else:
-            logger.info("Cache not found, processing dataset...")
-            self.samples = self._process_dataset(json_path, split, train_ratio, max_samples, seed)
-
-            logger.info(f"Saving processed dataset to cache: {cache_path}")
-            with open(cache_path, 'wb') as f:
-                pickle.dump(self.samples, f)
-
-        self._setup_tokenized_cache()
+        self.samples = self._process_dataset(json_path, split, train_ratio, max_samples, seed)
+        logger.info(f"Dataset ready with {len(self.samples)} samples")
 
     def _process_dataset(self, json_path: str, split: str, train_ratio: float,
                          max_samples: Optional[int], seed: int) -> List[Dict[str, str]]:
@@ -113,69 +91,6 @@ class DatasetProcessor(Dataset):
         logger.info(f"Created '{split}' dataset with {len(samples)} samples.")
         return samples
 
-    def _setup_tokenized_cache(self):
-        tokenizer_hash = hashlib.md5(str(self.tokenizer).encode()).hexdigest()[:8]
-        samples_hash = hashlib.md5(str(len(self.samples)).encode()).hexdigest()[:8]
-
-        tokenized_cache_path = os.path.join(
-            self.cache_dir,
-            f"tokenized_cache_{samples_hash}_{self.max_length}_{tokenizer_hash}.pkl"
-        )
-
-        if os.path.exists(tokenized_cache_path):
-            logger.info("Loading tokenized cache...")
-            with open(tokenized_cache_path, 'rb') as f:
-                self.tokenized_samples = pickle.load(f)
-            logger.info(f"Loaded {len(self.tokenized_samples)} tokenized samples from cache")
-        else:
-            logger.info("Pre-tokenizing all samples...")
-            self.tokenized_samples = self._parallel_tokenize()
-
-            logger.info("Saving tokenized cache...")
-            with open(tokenized_cache_path, 'wb') as f:
-                pickle.dump(self.tokenized_samples, f)
-
-            logger.info(f"Tokenized and cached {len(self.tokenized_samples)} samples")
-
-    def _parallel_tokenize(self) -> List[Dict[str, torch.Tensor]]:
-        def tokenize_batch(batch_samples):
-            batch_tokenized = []
-            for sample in batch_samples:
-                tokenized_sample = self._tokenize_sample(sample)
-                batch_tokenized.append(tokenized_sample)
-            return batch_tokenized
-
-        max_workers = min(8, mp.cpu_count())
-        batch_size = 500
-
-        tokenized_samples = []
-
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            batches = [
-                self.samples[i:i + batch_size]
-                for i in range(0, len(self.samples), batch_size)
-            ]
-
-            logger.info(f"Tokenizing {len(batches)} batches with {max_workers} workers")
-
-            futures = [executor.submit(tokenize_batch, batch) for batch in batches]
-
-            for i, future in enumerate(futures):
-                try:
-                    batch_result = future.result()
-                    tokenized_samples.extend(batch_result)
-
-                    if (i + 1) % 10 == 0:
-                        logger.info(f"Tokenized {(i + 1) * batch_size}/{len(self.samples)} samples")
-
-                except Exception as e:
-                    logger.error(f"Error tokenizing batch {i}: {e}")
-                    # Fall back to sequential tokenization for this batch
-                    batch_result = tokenize_batch(batches[i])
-                    tokenized_samples.extend(batch_result)
-
-        return tokenized_samples
-
     def _tokenize_sample(self, sample: Dict[str, str]) -> Dict[str, torch.Tensor]:
         anchor_encoding = self.tokenizer(
             sample['anchor'],
@@ -217,7 +132,7 @@ class DatasetProcessor(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        return self.tokenized_samples[idx]
+        return self._tokenize_sample(self.samples[idx])
 
     def get_sample_text(self, idx: int) -> Dict[str, str]:
         return self.samples[idx]

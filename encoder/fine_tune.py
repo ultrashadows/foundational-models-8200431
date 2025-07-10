@@ -47,7 +47,7 @@ def configure_gpu_memory():
             torch.cuda.set_per_process_memory_fraction(0.95, device=i)
 
         os.environ[
-            'PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:256,expandable_segments:True,roundup_power2_divisions:16'
+            'PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:1024,expandable_segments:True,roundup_power2_divisions:16'
 
         for i in range(torch.cuda.device_count()):
             total_memory = torch.cuda.get_device_properties(i).total_memory / (1024 ** 3)
@@ -70,7 +70,11 @@ def empty_cache():
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+
+
+def cleanup():
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 def setup(rank, world_size, backend='nccl'):
@@ -86,7 +90,7 @@ def setup(rank, world_size, backend='nccl'):
     os.environ['NCCL_PROTO'] = 'Simple'
     os.environ['NCCL_MIN_NRINGS'] = '8'
     os.environ['NCCL_MAX_NRINGS'] = '16'
-    os.environ['NCCL_BUFFSIZE'] = '33554432'
+    os.environ['NCCL_BUFFSIZE'] = '67108864'
     os.environ['NCCL_NTHREADS'] = '1024'
     os.environ['NCCL_TREE_THRESHOLD'] = '8589934592'
     os.environ['NCCL_IB_DISABLE'] = '0'
@@ -94,6 +98,8 @@ def setup(rank, world_size, backend='nccl'):
     os.environ['NCCL_IB_GID_INDEX'] = '3'
     os.environ['NCCL_NET_GDR_LEVEL'] = '5'
     os.environ['NCCL_P2P_LEVEL'] = 'NVL'
+    os.environ['NCCL_NVLS_ENABLE'] = '1'
+    os.environ['NCCL_DEBUG'] = 'INFO'
 
     dist.init_process_group(
         backend=backend,
@@ -113,81 +119,97 @@ def find_latest_checkpoint(checkpoint_dir):
     if not os.path.isdir(checkpoint_dir):
         return None, -1
 
-    checkpoints = [d for d in os.listdir(checkpoint_dir) if d.startswith("epoch_")]
-    if not checkpoints:
+    checkpoint_files = [f for f in os.listdir(checkpoint_dir) if
+                        f.startswith("checkpoint_epoch_") and f.endswith(".pt")]
+    if not checkpoint_files:
         return None, -1
 
-    last_epoch = max([int(d.split("_")[1]) for d in checkpoints])
-    latest_checkpoint = os.path.join(checkpoint_dir, f"epoch_{last_epoch}")
+    epochs = [int(f.split("_")[2].split(".")[0]) for f in checkpoint_files]
+    last_epoch = max(epochs)
+    latest_checkpoint = os.path.join(checkpoint_dir, f"checkpoint_epoch_{last_epoch}.pt")
 
     return latest_checkpoint, last_epoch
 
 
-def load_model_from_checkpoint_or_base(base_model_path, checkpoint_dir, device):
+def load_model_from_checkpoint_or_base(base_model_path, checkpoint_dir, device, rank):
     latest_checkpoint, last_epoch = find_latest_checkpoint(checkpoint_dir)
 
+    model = EncoderWrapper(model_name=base_model_path).to(device)
+    start_epoch = 0
+
     if latest_checkpoint and os.path.exists(latest_checkpoint):
-        logger.info(f"Loading model from checkpoint: {latest_checkpoint}")
-        model = EncoderWrapper(model_name=latest_checkpoint).to(device)
-        start_epoch = last_epoch + 1
+        logger.info(f"Loading checkpoint from: {latest_checkpoint}")
+        checkpoint = torch.load(latest_checkpoint, map_location=device)
+
+        model_state = checkpoint['model_state_dict']
+        model.load_state_dict(model_state)
+        start_epoch = checkpoint['epoch']
+
+        logger.info(f"Loaded checkpoint from epoch {start_epoch}")
     else:
-        logger.info(f"No checkpoint found. Loading base model from: {base_model_path}")
-        model = EncoderWrapper(model_name=base_model_path).to(device)
+        logger.info(f"No checkpoint found. Starting from base model: {base_model_path}")
         start_epoch = 0
+
+    if dist.is_initialized():
+        for param in model.parameters():
+            dist.broadcast(param.data, src=0)
+        dist.barrier()
 
     return model, start_epoch
 
 
-def load_training_state(optimizer, scheduler, scaler, checkpoint_dir, device):
-    latest_checkpoint, last_epoch = find_latest_checkpoint(checkpoint_dir)
-
-    if latest_checkpoint and os.path.exists(latest_checkpoint):
-        state_file = os.path.join(latest_checkpoint, "training_state.pt")
-        if os.path.exists(state_file):
-            logger.info(f"Loading training state from {state_file}")
-            state = torch.load(state_file, map_location=device)
-            optimizer.load_state_dict(state['optimizer'])
-            scheduler.load_state_dict(state['scheduler'])
-            if scaler and 'scaler' in state:
-                scaler.load_state_dict(state['scaler'])
-            logger.info(f"Loaded optimizer and scheduler state from epoch {last_epoch}")
-            return True
-
-    return False
-
-
-def save_checkpoint(model, optimizer, scheduler, scaler, tokenizer, epoch, checkpoint_dir, rank):
+def save_checkpoint(model, epoch, checkpoint_dir, rank):
     if rank == 0:
-        save_path = os.path.join(checkpoint_dir, f"epoch_{epoch}")
-        os.makedirs(save_path, exist_ok=True)
+        os.makedirs(checkpoint_dir, exist_ok=True)
 
-        model_to_save = model.module.encoder if hasattr(model, "module") else model.encoder
-        model_to_save.save_pretrained(save_path)
-        tokenizer.save_pretrained(save_path)
+        model_to_save = model.module if hasattr(model, "module") else model
 
-        state = {
-            'optimizer': optimizer.state_dict(),
-            'scheduler': scheduler.state_dict(),
+        checkpoint = {
+            'model_state_dict': model_to_save.state_dict(),
             'epoch': epoch
         }
-        if scaler:
-            state['scaler'] = scaler.state_dict()
 
-        torch.save(state, os.path.join(save_path, "training_state.pt"))
-        logger.info(f"Checkpoint saved at {save_path}")
+        checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_epoch_{epoch}.pt")
+        torch.save(checkpoint, checkpoint_path)
+
+        logger.info(f"Checkpoint saved: {checkpoint_path}")
+
+        cleanup_old_checkpoints(checkpoint_dir, keep_last=3)
 
     if dist.is_initialized():
         dist.barrier()
 
 
+def cleanup_old_checkpoints(checkpoint_dir, keep_last=3):
+    checkpoint_files = [f for f in os.listdir(checkpoint_dir) if
+                        f.startswith("checkpoint_epoch_") and f.endswith(".pt")]
+
+    if len(checkpoint_files) > keep_last:
+        checkpoint_files.sort(key=lambda x: int(x.split("_")[2].split(".")[0]))
+
+        for old_checkpoint in checkpoint_files[:-keep_last]:
+            old_path = os.path.join(checkpoint_dir, old_checkpoint)
+            try:
+                os.remove(old_path)
+                logger.info(f"Removed old checkpoint: {old_path}")
+            except OSError as e:
+                logger.warning(f"Could not remove old checkpoint {old_path}: {e}")
+
+
 def train_distributed(rank, world_size, num_epochs=10):
+    logger.info(f"[RANK {rank}] Starting train_distributed")
+
     backend = 'nccl' if platform.system() != 'Windows' else 'gloo'
+    logger.info(f"[RANK {rank}] About to call setup")
     setup(rank, world_size, backend=backend)
+    logger.info(f"[RANK {rank}] Setup completed")
 
     configure_gpu_memory()
+    logger.info(f"[RANK {rank}] GPU memory configured")
 
     torch.cuda.set_device(rank)
     device = torch.device(f'cuda:{rank}')
+    logger.info(f"[RANK {rank}] Device set to {device}")
 
     checkpoint_dir = "./checkpoints"
     os.makedirs(checkpoint_dir, exist_ok=True)
@@ -195,28 +217,37 @@ def train_distributed(rank, world_size, num_epochs=10):
     log_memory_usage(device, "[Before model loading]")
 
     base_model_path = "./models/albertina-1b5"
-    tokenizer = AutoTokenizer.from_pretrained(base_model_path)
 
+    logger.info(f"[RANK {rank}] Loading tokenizer")
+    tokenizer = AutoTokenizer.from_pretrained(base_model_path)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    logger.info(f"[RANK {rank}] Tokenizer loaded")
 
-    model, start_epoch = load_model_from_checkpoint_or_base(base_model_path, checkpoint_dir, device)
+    logger.info(f"[RANK {rank}] Loading model")
+    model, start_epoch = load_model_from_checkpoint_or_base(base_model_path, checkpoint_dir, device, rank)
+    logger.info(f"[RANK {rank}] Model loaded")
 
     if hasattr(model.encoder, "gradient_checkpointing_enable"):
         model.encoder.gradient_checkpointing_enable()
         logger.info(f"[RANK {rank}] Gradient checkpointing enabled")
 
+    logger.info(f"[RANK {rank}] About to wrap model in DDP")
     model = DDP(
         model,
         device_ids=[rank],
         output_device=rank,
         find_unused_parameters=False,
-        broadcast_buffers=False,
+        broadcast_buffers=True,
         gradient_as_bucket_view=True,
-        bucket_cap_mb=512,
-        static_graph=True
+        bucket_cap_mb=256,
+        static_graph=False
     )
-    logger.info(f"[RANK {rank}] Model loaded and wrapped in DDP.")
+    print(f"[RANK {rank}] Model wrapped in DDP successfully")
+
+    if dist.is_initialized():
+        dist.barrier()
+        logger.info(f"[RANK {rank}] Passed DDP wrapping barrier")
 
     optimizer = optim.AdamW(
         model.parameters(),
@@ -227,8 +258,8 @@ def train_distributed(rank, world_size, num_epochs=10):
         fused=True
     )
 
-    train_batch_size = 64
-    test_batch_size = 64
+    train_batch_size = 128
+    test_batch_size = 128
     max_length = 512
 
     train_dataset = DatasetProcessor(
@@ -246,7 +277,7 @@ def train_distributed(rank, world_size, num_epochs=10):
         drop_last=True
     )
 
-    num_workers = mp.cpu_count()
+    num_workers = 24
     train_loader = DataLoader(
         dataset=train_dataset,
         batch_size=train_batch_size,
@@ -271,11 +302,15 @@ def train_distributed(rank, world_size, num_epochs=10):
             batch_size=test_batch_size,
             shuffle=False,
             pin_memory=True,
-            num_workers=num_workers // 2,
+            num_workers=num_workers,
             persistent_workers=True,
-            prefetch_factor=4,
+            prefetch_factor=2,
             drop_last=False,
         )
+
+    if dist.is_initialized():
+        dist.barrier()
+        logger.info(f"[RANK {rank}] Passed dataset creation barrier")
 
     total_steps = len(train_loader) * num_epochs
 
@@ -292,7 +327,9 @@ def train_distributed(rank, world_size, num_epochs=10):
     use_bf16 = True
     scaler = GradScaler(enabled=not use_bf16)
 
-    load_training_state(optimizer, scheduler, scaler, checkpoint_dir, device)
+    if dist.is_initialized():
+        dist.barrier()
+        logger.info(f"[RANK {rank}] Ready to start training")
 
     run_training_loop(rank, world_size, model, tokenizer, train_dataset, train_loader, test_loader,
                       train_sampler, num_epochs, start_epoch, checkpoint_dir,
@@ -308,7 +345,7 @@ def run_training_loop(rank, world_size, model, tokenizer, train_dataset, train_l
 
     criterion = TripletLoss(margin=0.5)
 
-    accumulation_steps = 4
+    accumulation_steps = 1
 
     is_main_process = (rank == 0 or world_size == 1)
     writer = SummaryWriter(log_dir="./runs/albertina_triplet") if is_main_process else None
@@ -379,7 +416,7 @@ def run_training_loop(rank, world_size, model, tokenizer, train_dataset, train_l
                     f"LR: {current_lr:.2e}"
                 )
 
-            if (i + 1) % 1000 == 0:
+            if (i + 1) % 100 == 0:
                 empty_cache()
 
         if len(train_loader) % accumulation_steps != 0:
@@ -407,7 +444,7 @@ def run_training_loop(rank, world_size, model, tokenizer, train_dataset, train_l
                 f"Epoch {epoch + 1}/{num_epochs}, Train Avg Loss: {avg_train_loss:.4f}, "
                 f"Time: {epoch_time:.2f}s, Samples/sec: {len(train_dataset) / epoch_time:.1f}")
 
-            if test_loader is not None and (epoch + 1) % 10 == 0:
+            if test_loader is not None and (epoch + 1) % 5 == 0:
                 model.eval()
                 test_loss = 0.0
                 test_batches = 0
@@ -432,8 +469,8 @@ def run_training_loop(rank, world_size, model, tokenizer, train_dataset, train_l
                 if writer:
                     writer.add_scalar("Loss/Test", avg_test_loss, epoch)
 
-        if (epoch + 1) % 5 == 0:
-            save_checkpoint(model, optimizer, scheduler, scaler, tokenizer, epoch + 1, checkpoint_dir, rank)
+        if (epoch + 1) % 10 == 0:
+            save_checkpoint(model, epoch + 1, checkpoint_dir, rank)
 
         empty_cache()
 
@@ -451,6 +488,12 @@ def run_training_loop(rank, world_size, model, tokenizer, train_dataset, train_l
 def main():
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+    if hasattr(mp, 'set_start_method'):
+        try:
+            mp.set_start_method('spawn', force=True)
+        except RuntimeError:
+            pass
+
     setup_logging()
 
     if platform.system() != 'Windows':
@@ -462,8 +505,8 @@ def main():
         torch.backends.cudnn.enabled = True
         torch.backends.cuda.enable_flash_sdp(True)
 
-        torch.set_num_threads(min(64, os.cpu_count()))
-        torch.set_num_interop_threads(min(16, os.cpu_count() // 4))
+        torch.set_num_threads(min(32, os.cpu_count()))
+        torch.set_num_interop_threads(min(8, os.cpu_count() // 4))
 
         logger.info("All CUDNN and TF32 optimizations enabled")
 
