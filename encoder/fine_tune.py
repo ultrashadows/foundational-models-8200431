@@ -109,32 +109,51 @@ def cleanup():
         dist.destroy_process_group()
 
 
-def load_latest_checkpoint(model, optimizer, scheduler, scaler, checkpoint_dir, device):
-    last_epoch = -1
-    if os.path.isdir(checkpoint_dir):
-        checkpoints = [d for d in os.listdir(checkpoint_dir) if d.startswith("epoch_")]
-        if checkpoints:
-            last_epoch = max([int(d.split("_")[1]) for d in checkpoints])
-            latest_checkpoint = os.path.join(checkpoint_dir, f"epoch_{last_epoch}")
+def find_latest_checkpoint(checkpoint_dir):
+    if not os.path.isdir(checkpoint_dir):
+        return None, -1
 
-            logger.info(f"Loading checkpoint from {latest_checkpoint}")
+    checkpoints = [d for d in os.listdir(checkpoint_dir) if d.startswith("epoch_")]
+    if not checkpoints:
+        return None, -1
 
-            if hasattr(model, 'module'):
-                model.module.encoder = model.module.encoder.from_pretrained(latest_checkpoint).to(device)
-            else:
-                model.encoder = model.encoder.from_pretrained(latest_checkpoint).to(device)
+    last_epoch = max([int(d.split("_")[1]) for d in checkpoints])
+    latest_checkpoint = os.path.join(checkpoint_dir, f"epoch_{last_epoch}")
 
-            state_file = os.path.join(latest_checkpoint, "training_state.pt")
-            if os.path.exists(state_file):
-                state = torch.load(state_file, map_location=device)
-                optimizer.load_state_dict(state['optimizer'])
-                scheduler.load_state_dict(state['scheduler'])
-                if scaler and 'scaler' in state:
-                    scaler.load_state_dict(state['scaler'])
-                logger.info(f"Loaded optimizer and scheduler state from epoch {last_epoch}")
+    return latest_checkpoint, last_epoch
 
-            logger.info(f"Resumed from epoch {last_epoch}")
-    return last_epoch + 1
+
+def load_model_from_checkpoint_or_base(base_model_path, checkpoint_dir, device):
+    latest_checkpoint, last_epoch = find_latest_checkpoint(checkpoint_dir)
+
+    if latest_checkpoint and os.path.exists(latest_checkpoint):
+        logger.info(f"Loading model from checkpoint: {latest_checkpoint}")
+        model = EncoderWrapper(model_name=latest_checkpoint).to(device)
+        start_epoch = last_epoch + 1
+    else:
+        logger.info(f"No checkpoint found. Loading base model from: {base_model_path}")
+        model = EncoderWrapper(model_name=base_model_path).to(device)
+        start_epoch = 0
+
+    return model, start_epoch
+
+
+def load_training_state(optimizer, scheduler, scaler, checkpoint_dir, device):
+    latest_checkpoint, last_epoch = find_latest_checkpoint(checkpoint_dir)
+
+    if latest_checkpoint and os.path.exists(latest_checkpoint):
+        state_file = os.path.join(latest_checkpoint, "training_state.pt")
+        if os.path.exists(state_file):
+            logger.info(f"Loading training state from {state_file}")
+            state = torch.load(state_file, map_location=device)
+            optimizer.load_state_dict(state['optimizer'])
+            scheduler.load_state_dict(state['scheduler'])
+            if scaler and 'scaler' in state:
+                scaler.load_state_dict(state['scaler'])
+            logger.info(f"Loaded optimizer and scheduler state from epoch {last_epoch}")
+            return True
+
+    return False
 
 
 def save_checkpoint(model, optimizer, scheduler, scaler, tokenizer, epoch, checkpoint_dir, rank):
@@ -175,13 +194,13 @@ def train_distributed(rank, world_size, num_epochs=10):
 
     log_memory_usage(device, "[Before model loading]")
 
-    model_name = "./models/albertina-1b5"
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    base_model_path = "./models/albertina-1b5"
+    tokenizer = AutoTokenizer.from_pretrained(base_model_path)
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model = EncoderWrapper(model_name=model_name).to(device)
+    model, start_epoch = load_model_from_checkpoint_or_base(base_model_path, checkpoint_dir, device)
 
     if hasattr(model.encoder, "gradient_checkpointing_enable"):
         model.encoder.gradient_checkpointing_enable()
@@ -201,16 +220,15 @@ def train_distributed(rank, world_size, num_epochs=10):
 
     optimizer = optim.AdamW(
         model.parameters(),
-        lr=3e-5,
+        lr=2e-4,
         weight_decay=0.01,
         betas=(0.9, 0.999),
         eps=1e-8,
         fused=True
     )
 
-    train_batch_size = 32
-    test_batch_size = 32
-
+    train_batch_size = 64
+    test_batch_size = 64
     max_length = 512
 
     train_dataset = DatasetProcessor(
@@ -228,7 +246,7 @@ def train_distributed(rank, world_size, num_epochs=10):
         drop_last=True
     )
 
-    num_workers = min(16, mp.cpu_count() // world_size)
+    num_workers = mp.cpu_count()
     train_loader = DataLoader(
         dataset=train_dataset,
         batch_size=train_batch_size,
@@ -236,7 +254,7 @@ def train_distributed(rank, world_size, num_epochs=10):
         pin_memory=True,
         num_workers=num_workers,
         persistent_workers=True,
-        prefetch_factor=4,
+        prefetch_factor=8,
         drop_last=True,
     )
 
@@ -263,7 +281,7 @@ def train_distributed(rank, world_size, num_epochs=10):
 
     scheduler = optim.lr_scheduler.OneCycleLR(
         optimizer,
-        max_lr=8e-5,
+        max_lr=2e-4,
         total_steps=total_steps,
         pct_start=0.05,
         anneal_strategy='cos',
@@ -274,7 +292,7 @@ def train_distributed(rank, world_size, num_epochs=10):
     use_bf16 = True
     scaler = GradScaler(enabled=not use_bf16)
 
-    start_epoch = load_latest_checkpoint(model, optimizer, scheduler, scaler, checkpoint_dir, device)
+    load_training_state(optimizer, scheduler, scaler, checkpoint_dir, device)
 
     run_training_loop(rank, world_size, model, tokenizer, train_dataset, train_loader, test_loader,
                       train_sampler, num_epochs, start_epoch, checkpoint_dir,
@@ -298,6 +316,7 @@ def run_training_loop(rank, world_size, model, tokenizer, train_dataset, train_l
     effective_batch_size = train_loader.batch_size * world_size * accumulation_steps
     logger.info(f"[RANK {rank}] Starting training with BF16={use_bf16}")
     logger.info(f"[RANK {rank}] Effective batch size: {effective_batch_size}")
+    logger.info(f"[RANK {rank}] Starting from epoch: {start_epoch}")
 
     for epoch in range(start_epoch, num_epochs):
         model.train()
