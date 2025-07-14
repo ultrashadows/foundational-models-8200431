@@ -186,7 +186,7 @@ def train_distributed(rank, world_size, num_epochs=10):
         fused=True
     )
 
-    train_batch_size = 64
+    train_batch_size = 32
     max_length = 512
 
     train_dataset = DatasetProcessor(
@@ -194,6 +194,10 @@ def train_distributed(rank, world_size, num_epochs=10):
         split="train",
         max_length=max_length,
         max_samples=10000,
+        chunk_overlap=75,
+        use_chunking_threshold=400,
+        max_chunks_per_sample=2,
+        preserve_structure=True,
     )
 
     train_sampler = DistributedSampler(
@@ -221,7 +225,11 @@ def train_distributed(rank, world_size, num_epochs=10):
             tokenizer=tokenizer,
             split="test",
             max_length=max_length,
-            max_samples=10000
+            max_samples=10000,
+            chunk_overlap=75,
+            use_chunking_threshold=400,
+            max_chunks_per_sample=2,
+            preserve_structure=True,
         )
         test_loader = DataLoader(
             dataset=test_dataset,
