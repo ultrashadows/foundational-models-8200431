@@ -334,7 +334,7 @@ def run_training_loop(rank, world_size, model, tokenizer, train_dataset, train_l
                 f"Epoch {epoch + 1}/{num_epochs}, Train Avg Loss: {avg_train_loss:.4f}, "
                 f"Time: {epoch_time:.2f}s, Samples/sec: {len(train_dataset) / epoch_time:.1f}")
 
-            if test_loader is not None and (epoch + 1) % 3 == 0:
+            if test_loader is not None and (epoch + 1) % 10 == 0:
                 model.eval()
                 test_loss = 0.0
                 test_batches = 0
@@ -355,9 +355,52 @@ def run_training_loop(rank, world_size, model, tokenizer, train_dataset, train_l
                         test_batches += 1
 
                 avg_test_loss = test_loss / test_batches if test_batches > 0 else 0
-                logger.info(f"Epoch {epoch + 1}/{num_epochs}, Test Avg Loss: {avg_test_loss:.4f}")
+
+                all_anchors = []
+                all_positives = []
+
+                model.eval()
+                with torch.no_grad():
+                    for batch in test_loader:
+                        anchor_inputs = {k: v.to(device) for k, v in batch["anchor"].items()}
+                        positive_inputs = {k: v.to(device) for k, v in batch["positive"].items()}
+
+                        with autocast(device_type='cuda', dtype=torch.bfloat16, enabled=True):
+                            anchor_embeds = model(anchor_inputs["input_ids"], anchor_inputs["attention_mask"])
+                            positive_embeds = model(positive_inputs["input_ids"], positive_inputs["attention_mask"])
+
+                        all_anchors.append(anchor_embeds)
+                        all_positives.append(positive_embeds)
+
+                anchors = torch.cat(all_anchors, dim=0)
+                positives = torch.cat(all_positives, dim=0)
+
+                similarities = torch.matmul(anchors, positives.T)
+                ranks = similarities.argsort(dim=-1, descending=True)
+
+                recall_at_5 = 0
+                mrr_total = 0
+                N = anchors.size(0)
+
+                for i in range(N):
+                    rank_list = ranks[i]
+                    correct_index = i
+                    rank_position = (rank_list == correct_index).nonzero(as_tuple=True)[0].item()
+                    if rank_position < 5:
+                        recall_at_5 += 1
+                    mrr_total += 1.0 / (rank_position + 1)
+
+                recall_at_5 /= N
+                mrr_score = mrr_total / N
+
+                logger.info(
+                    f"Epoch {epoch + 1}/{num_epochs}, Test Loss: {avg_test_loss:.4f}, Recall@5: {recall_at_5:.4f}, "
+                    f"MRR: {mrr_score:.4f}")
+
                 if writer:
                     writer.add_scalar("Loss/Test", avg_test_loss, epoch)
+                    writer.add_scalar("Metrics/Recall@5", recall_at_5, epoch)
+                    writer.add_scalar("Metrics/MRR", mrr_score, epoch)
 
         if (epoch + 1) % 5 == 0:
             save_checkpoint(model, epoch + 1, checkpoint_dir, rank)
