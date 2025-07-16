@@ -5,6 +5,8 @@ from torch.utils.data import Dataset
 
 class DatasetProcessor(Dataset):
     def __init__(self, tokenizer, split: str, max_length: int, dataset: str):
+        assert split in {"train", "test"}, f"Invalid split: {split}"
+
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.dataset_path = os.path.join("datasets", dataset)
@@ -13,7 +15,13 @@ class DatasetProcessor(Dataset):
             raise FileNotFoundError(f"Dataset file not found: {self.dataset_path}")
 
         with open(self.dataset_path, "r", encoding="utf-8") as f:
-            self.samples = json.load(f)
+            all_samples = json.load(f)
+
+        split_index = int(0.8 * len(all_samples))
+        if split == "train":
+            self.samples = all_samples[:split_index]
+        else:
+            self.samples = all_samples[split_index:]
 
         if split == "train":
             from random import shuffle
