@@ -14,7 +14,6 @@ from transformers import AutoTokenizer
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.amp import autocast
 from torch.utils.tensorboard import SummaryWriter
-from dataset_processor import DatasetProcessor
 from triplet_loss import TripletLoss
 from wrapper import EncoderWrapper
 from tqdm import tqdm
@@ -193,11 +192,7 @@ def train_distributed(rank, world_size, num_epochs=10):
         tokenizer=tokenizer,
         split="train",
         max_length=max_length,
-        max_samples=10000,
-        chunk_overlap=75,
-        use_chunking_threshold=400,
-        max_chunks_per_sample=2,
-        preserve_structure=True,
+        dataset="dataset_1.json"
     )
 
     train_sampler = DistributedSampler(
@@ -225,11 +220,7 @@ def train_distributed(rank, world_size, num_epochs=10):
             tokenizer=tokenizer,
             split="test",
             max_length=max_length,
-            max_samples=10000,
-            chunk_overlap=75,
-            use_chunking_threshold=400,
-            max_chunks_per_sample=2,
-            preserve_structure=True,
+            dataset="dataset_1.json"
         )
         test_loader = DataLoader(
             dataset=test_dataset,
