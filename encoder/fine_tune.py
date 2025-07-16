@@ -179,8 +179,8 @@ def train_distributed(rank, world_size, num_epochs=10):
 
     optimizer = optim.AdamW(
         model.parameters(),
-        lr=4e-4,
-        weight_decay=0.01,
+        lr=2e-4,
+        weight_decay=0.001,
         betas=(0.9, 0.999),
         eps=1e-8,
         fused=True
@@ -240,10 +240,9 @@ def train_distributed(rank, world_size, num_epochs=10):
         optimizer,
         max_lr=4e-4,
         total_steps=total_steps,
-        pct_start=0.03,
+        pct_start=0.1,
         anneal_strategy='cos',
-        div_factor=10,
-        final_div_factor=1000,
+        div_factor=5,
     )
 
     run_training_loop(rank, world_size, model, tokenizer, train_dataset, train_loader, test_loader,
@@ -256,7 +255,7 @@ def run_training_loop(rank, world_size, model, tokenizer, train_dataset, train_l
                       train_sampler, num_epochs, start_epoch, checkpoint_dir,
                       optimizer, scheduler):
     device = torch.device(f'cuda:{rank}')
-    criterion = TripletLoss(margin=0.3)
+    criterion = TripletLoss(margin=0)
     accumulation_steps = 4
 
     is_main_process = (rank == 0)
@@ -268,6 +267,7 @@ def run_training_loop(rank, world_size, model, tokenizer, train_dataset, train_l
         logger.info(f"Starting from epoch: {start_epoch}")
 
     for epoch in range(start_epoch, num_epochs):
+        criterion.set_margin(min(0.3, ((epoch + 1) / 5) * 0.3))
         model.train()
         running_loss = 0.0
         num_batches = 0

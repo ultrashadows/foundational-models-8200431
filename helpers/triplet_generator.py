@@ -44,7 +44,14 @@ def precompute_chunk_embeddings(all_chunks: List[str]) -> torch.Tensor:
     return torch.cat(embeddings, dim=0) if embeddings else torch.empty(0, model.get_sentence_embedding_dimension())
 
 
-def find_best_and_worst_chunks_vectorized(query_embedding, correct_chunks, wrong_chunks, correct_embeddings, wrong_embeddings):
+def find_best_and_worst_chunks_vectorized(
+    query_embedding,
+    correct_chunks,
+    wrong_chunks,
+    correct_embeddings,
+    wrong_embeddings,
+    hard_negative_k=3
+):
     if len(correct_chunks) == 0 or len(wrong_chunks) == 0:
         return None, None
 
@@ -52,9 +59,16 @@ def find_best_and_worst_chunks_vectorized(query_embedding, correct_chunks, wrong
     wrong_scores = util.cos_sim(query_embedding, wrong_embeddings)[0]
 
     best_idx = correct_scores.argmax().item()
-    worst_idx = wrong_scores.argmin().item()
+    positive = correct_chunks[best_idx]
 
-    return correct_chunks[best_idx], wrong_chunks[worst_idx]
+    top_k = min(hard_negative_k, len(wrong_scores))
+    topk_indices = torch.topk(wrong_scores, k=top_k, largest=True).indices.tolist()
+
+    import random
+    negative_idx = random.choice(topk_indices)
+    negative = wrong_chunks[negative_idx]
+
+    return positive, negative
 
 
 def get_last_dataset_index() -> int:
