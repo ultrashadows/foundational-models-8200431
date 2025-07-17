@@ -145,117 +145,91 @@ def cleanup_old_checkpoints(checkpoint_dir, keep_last=2):
                 logger.warning(f"Could not remove old checkpoint {old_path}: {e}")
 
 
-def train_distributed(rank, world_size, num_epochs=10):
+def train_distributed(rank, world_size, num_epochs=10, start_index=1, num_datasets=4):
     dist.init_process_group(backend='nccl')
 
     configure_gpu_memory()
     torch.cuda.set_device(rank)
     device = torch.device(f'cuda:{rank}')
 
-    checkpoint_dir = "./checkpoints"
-    if rank == 0:
-        os.makedirs(checkpoint_dir, exist_ok=True)
-
     base_model_path = "./models/albertina-1b5"
-
     tokenizer = AutoTokenizer.from_pretrained(base_model_path)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model, start_epoch = load_model_from_checkpoint_or_base(base_model_path, checkpoint_dir, device, rank)
+    prev_checkpoint_path = "./models/albertina-1b5"
 
-    model.encoder.gradient_checkpointing_enable()
+    for dataset_id in range(start_index, start_index + num_datasets):
+        dataset_name = f"dataset_{dataset_id}.json"
+        checkpoint_dir = f"./checkpoints/dataset_{dataset_id}"
+        if rank == 0:
+            os.makedirs(checkpoint_dir, exist_ok=True)
 
-    model = DDP(
-        model,
-        device_ids=[rank],
-        output_device=rank,
-        find_unused_parameters=False,
-        broadcast_buffers=False,
-        gradient_as_bucket_view=True,
-        bucket_cap_mb=512,
-        static_graph=True
-    )
-
-    optimizer = optim.AdamW(
-        model.parameters(),
-        lr=2e-4,
-        weight_decay=0.001,
-        betas=(0.9, 0.999),
-        eps=1e-8,
-        fused=True
-    )
-
-    train_batch_size = 32
-    max_length = 512
-
-    train_dataset = DatasetProcessor(
-        tokenizer=tokenizer,
-        split="train",
-        max_length=max_length,
-        dataset="dataset_1.json"
-    )
-
-    train_sampler = DistributedSampler(
-        dataset=train_dataset,
-        num_replicas=world_size,
-        rank=rank,
-        shuffle=True,
-        drop_last=True
-    )
-
-    train_loader = DataLoader(
-        dataset=train_dataset,
-        batch_size=train_batch_size,
-        sampler=train_sampler,
-        pin_memory=True,
-        num_workers=32,
-        persistent_workers=True,
-        prefetch_factor=8,
-        drop_last=True,
-    )
-
-    test_loader = None
-    if rank == 0:
-        test_dataset = DatasetProcessor(
-            tokenizer=tokenizer,
-            split="test",
-            max_length=max_length,
-            dataset="dataset_1.json"
-        )
-        test_loader = DataLoader(
-            dataset=test_dataset,
-            batch_size=train_batch_size,
-            shuffle=False,
-            pin_memory=True,
-            num_workers=16,
-            persistent_workers=True,
-            prefetch_factor=4,
-            drop_last=False,
+        model, start_epoch = load_model_from_checkpoint_or_base(
+            base_model_path=prev_checkpoint_path,
+            checkpoint_dir=checkpoint_dir,
+            device=device,
+            rank=rank
         )
 
-    total_steps = len(train_loader) * num_epochs
+        prev_checkpoint_path = checkpoint_dir
 
-    scheduler = optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=4e-4,
-        total_steps=total_steps,
-        pct_start=0.1,
-        anneal_strategy='cos',
-        div_factor=5,
-    )
+        model.encoder.gradient_checkpointing_enable()
 
-    run_training_loop(rank, world_size, model, tokenizer, train_dataset, train_loader, test_loader,
-                      train_sampler, num_epochs, start_epoch, checkpoint_dir,
-                      optimizer, scheduler)
+        model = DDP(
+            model,
+            device_ids=[rank],
+            output_device=rank,
+            find_unused_parameters=False,
+            broadcast_buffers=False,
+            gradient_as_bucket_view=True,
+            bucket_cap_mb=512,
+            static_graph=True
+        )
+
+        optimizer = optim.AdamW(
+            model.parameters(),
+            lr=2e-4,
+            weight_decay=0.001,
+            betas=(0.9, 0.999),
+            eps=1e-8,
+            fused=True
+        )
+
+        train_dataset = DatasetProcessor(tokenizer, split="train", max_length=512, dataset=dataset_name)
+        train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True)
+        train_loader = DataLoader(train_dataset, batch_size=32, sampler=train_sampler, pin_memory=True,
+                                  num_workers=32, persistent_workers=True, prefetch_factor=8, drop_last=True)
+
+        test_loader = None
+        if rank == 0:
+            test_dataset = DatasetProcessor(tokenizer, split="test", max_length=512, dataset=dataset_name)
+            test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, pin_memory=True,
+                                     num_workers=16, persistent_workers=True, prefetch_factor=4, drop_last=False)
+
+        total_steps = len(train_loader) * num_epochs
+        scheduler = optim.lr_scheduler.OneCycleLR(
+            optimizer, max_lr=4e-4, total_steps=total_steps, pct_start=0.1,
+            anneal_strategy='cos', div_factor=5,
+        )
+
+        logger.info(f"Starting training on {dataset_name}")
+        run_training_loop(rank, world_size, model, tokenizer, train_dataset, train_loader, test_loader,
+                          train_sampler, num_epochs, start_epoch, checkpoint_dir, optimizer, scheduler, dataset_id)
+
+        if dist.is_initialized():
+            dist.barrier()
+        torch.cuda.empty_cache()
+        gc.collect()
+
     cleanup()
 
 
 def run_training_loop(rank, world_size, model, tokenizer, train_dataset, train_loader, test_loader,
                       train_sampler, num_epochs, start_epoch, checkpoint_dir,
-                      optimizer, scheduler):
+                      optimizer, scheduler, dataset_id):
     device = torch.device(f'cuda:{rank}')
-    criterion = TripletLoss(margin=0)
+    criterion = TripletLoss(margin=0.1)
     accumulation_steps = 4
 
     is_main_process = (rank == 0)
@@ -267,7 +241,6 @@ def run_training_loop(rank, world_size, model, tokenizer, train_dataset, train_l
         logger.info(f"Starting from epoch: {start_epoch}")
 
     for epoch in range(start_epoch, num_epochs):
-        criterion.set_margin(min(0.3, ((epoch + 1) / 5) * 0.3))
         model.train()
         running_loss = 0.0
         num_batches = 0
@@ -410,10 +383,11 @@ def run_training_loop(rank, world_size, model, tokenizer, train_dataset, train_l
 
     if is_main_process:
         model_to_save = model.module.encoder if hasattr(model, "module") else model.encoder
-        final_save_path = "./finetuned-albertina-1b5-triplet-loss"
+        final_save_path = f"./results/finetuned-albertina-1b5-triplet-loss-dataset-{dataset_id}"
+        os.makedirs(final_save_path, exist_ok=True)
         model_to_save.save_pretrained(final_save_path)
         tokenizer.save_pretrained(final_save_path)
-        logger.info(f"Model and tokenizer saved to {final_save_path}")
+        logger.info(f"✅ Model and tokenizer saved to {final_save_path}")
 
     if writer:
         writer.close()
