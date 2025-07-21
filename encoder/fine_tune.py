@@ -1,3 +1,4 @@
+import copy
 import os
 import logging
 import gc
@@ -7,7 +8,6 @@ import time
 import psutil
 import torch
 import torch.distributed as dist
-import torch.optim as optim
 import torch.nn.functional as F
 
 from torch.utils.data import DataLoader
@@ -153,10 +153,13 @@ def cleanup_old_checkpoints(checkpoint_dir, keep_last=3):
                 logger.warning(f"Could not remove old checkpoint {old_path}: {e}")
 
 
+def update_momentum_model(model, momentum_model, m=0.995):
+    for param_q, param_k in zip(model.parameters(), momentum_model.parameters()):
+        param_k.data = param_k.data * m + param_q.data * (1. - m)
+
+
 def train_distributed(rank, world_size, num_epochs=10, start_index=1, num_datasets=1):
     dist.init_process_group(backend='nccl')
-
-    configure_gpu_memory()
     torch.cuda.set_device(rank)
     device = torch.device(f'cuda:{rank}')
 
@@ -165,7 +168,7 @@ def train_distributed(rank, world_size, num_epochs=10, start_index=1, num_datase
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    prev_checkpoint_path = "./models/albertina-1b5"
+    prev_checkpoint_path = base_model_path
 
     for dataset_id in range(start_index, start_index + num_datasets):
         dataset_name = f"dataset_{dataset_id}.json"
@@ -173,16 +176,13 @@ def train_distributed(rank, world_size, num_epochs=10, start_index=1, num_datase
         if rank == 0:
             os.makedirs(checkpoint_dir, exist_ok=True)
 
-        model, start_epoch, optimizer_state, scheduler_state = load_model_from_checkpoint_or_base(
-            base_model_path=prev_checkpoint_path,
-            checkpoint_dir=checkpoint_dir,
-            device=device,
-            rank=rank
-        )
-
-        prev_checkpoint_path = checkpoint_dir
-
+        model = EncoderWrapper(model_name=prev_checkpoint_path).to(device)
         model.encoder.gradient_checkpointing_enable()
+
+        momentum_model = copy.deepcopy(model)
+        for p in momentum_model.parameters():
+            p.requires_grad = False
+        momentum_model.eval()
 
         model = DDP(
             model,
@@ -195,79 +195,58 @@ def train_distributed(rank, world_size, num_epochs=10, start_index=1, num_datase
             static_graph=True
         )
 
-        projection_params = list(model.module.projection.parameters()) if hasattr(model, "module") else list(
-            model.projection.parameters())
+        projection_params = list(model.module.projection.parameters())
         encoder_params = [p for n, p in model.named_parameters() if "projection" not in n]
 
         optimizer = torch.optim.AdamW([
-            {"params": encoder_params, "weight_decay": 0.01},
-            {"params": projection_params, "weight_decay": 0.1}
-        ], lr=1e-5, betas=(0.9, 0.999), eps=1e-8)
-
-        if optimizer_state is not None:
-            optimizer.load_state_dict(optimizer_state)
+            {"params": encoder_params, "weight_decay": 0.01, "lr": 1e-5},
+            {"params": projection_params, "weight_decay": 0.01, "lr": 3e-4}
+        ], betas=(0.9, 0.999), eps=1e-8)
 
         train_dataset = DatasetProcessor(tokenizer, split="train", max_length=512, dataset=dataset_name)
+        test_loader = None
 
-        if start_epoch < 3:
-            logger.info(f"Skipping hard negative precomputation for early epochs (epoch {start_epoch})")
-        else:
-            logger.info("Precomputing hard negatives")
-            train_dataset.precompute_hard_negatives(model, tokenizer, device)
+        if num_epochs >= 3:
+            train_dataset.precompute_hard_negatives(momentum_model, tokenizer, device)
+            train_dataset.precompute_hard_positives(momentum_model, tokenizer, device)
 
         train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True,
                                            drop_last=True)
         train_loader = DataLoader(train_dataset, batch_size=32, sampler=train_sampler, pin_memory=True,
                                   num_workers=32, persistent_workers=True, prefetch_factor=8, drop_last=True)
 
-        test_loader = None
         if rank == 0:
             test_dataset = DatasetProcessor(tokenizer, split="test", max_length=512, dataset=dataset_name)
             test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, pin_memory=True,
                                      num_workers=16, persistent_workers=True, prefetch_factor=4, drop_last=False)
 
         total_steps = len(train_loader) * num_epochs
-
-        scheduler = get_linear_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=500,
-            num_training_steps=total_steps
-        )
-
-        if scheduler_state is not None:
-            scheduler.load_state_dict(scheduler_state)
+        scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=500, num_training_steps=total_steps)
 
         logger.info(f"Starting training on {dataset_name}")
-        run_training_loop(rank, world_size, model, tokenizer, train_dataset, train_loader, test_loader,
-                          train_sampler, num_epochs, start_epoch, checkpoint_dir, optimizer, scheduler, dataset_id)
+        run_training_loop(rank, world_size, model, momentum_model, tokenizer, train_dataset, train_loader, test_loader,
+                          train_sampler, num_epochs, 0, checkpoint_dir, optimizer, scheduler, dataset_id)
 
         if dist.is_initialized():
             dist.barrier()
         torch.cuda.empty_cache()
         gc.collect()
 
-    cleanup()
+    dist.destroy_process_group()
 
 
-def run_training_loop(rank, world_size, model, tokenizer, train_dataset, train_loader, test_loader,
+def run_training_loop(rank, world_size, model, momentum_model, tokenizer, train_dataset, train_loader, test_loader,
                       train_sampler, num_epochs, start_epoch, checkpoint_dir,
                       optimizer, scheduler, dataset_id):
     device = torch.device(f'cuda:{rank}')
-
-    initial_margin = 0.5
-    final_margin = 0.1
+    initial_margin = 0.1
+    final_margin = 0.05
     criterion = TripletLoss(margin=initial_margin, mining_strategy='adaptive')
-
     accumulation_steps = 8
     max_grad_norm = 0.5
 
     is_main_process = (rank == 0)
     writer = SummaryWriter(log_dir=f"./runs/albertina_triplet_dataset_{dataset_id}") if is_main_process else None
-
-    effective_batch_size = train_loader.batch_size * world_size * accumulation_steps
-    if is_main_process:
-        logger.info(f"Effective batch size: {effective_batch_size}")
-        logger.info(f"Starting from epoch: {start_epoch}")
 
     best_loss = float('inf')
     patience_counter = 0
@@ -277,62 +256,46 @@ def run_training_loop(rank, world_size, model, tokenizer, train_dataset, train_l
     for epoch in range(start_epoch, num_epochs):
         model.train()
         running_loss = 0.0
+        batch_losses = []
         num_batches = 0
         epoch_start_time = time.time()
 
         progress = epoch / num_epochs
-        current_margin = initial_margin * (1 - progress) + final_margin * progress
+        current_margin = max(final_margin, initial_margin * (1 - progress))
         criterion.set_margin(current_margin)
 
         train_sampler.set_epoch(epoch)
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs}") if is_main_process else train_loader
 
-        if epoch > 1 and epoch % 2 == 0 and hasattr(train_dataset, 'precompute_hard_negatives'):
-            if is_main_process:
-                logger.info(f"Recomputing hard negatives at epoch {epoch + 1}")
-            train_dataset.precompute_hard_negatives(model, tokenizer, device)
-
-        batch_losses = []
+        if epoch > 5 and epoch % 2 == 0:
+            train_dataset.precompute_hard_negatives(momentum_model, tokenizer, device)
 
         for i, batch in enumerate(progress_bar):
-            anchor_inputs = {k: v.to(device, non_blocking=True) for k, v in batch['anchor'].items()}
-            positive_inputs = {k: v.to(device, non_blocking=True) for k, v in batch['positive'].items()}
-            negative_inputs = {k: v.to(device, non_blocking=True) for k, v in batch['negative'].items()}
-            weights = batch['weight'].to(device, non_blocking=True) if 'weight' in batch else None
+            anchor_inputs = {k: v.to(device) for k, v in batch['anchor'].items()}
+            positive_inputs = {k: v.to(device) for k, v in batch['positive'].items()}
+            negative_inputs = {k: v.to(device) for k, v in batch['negative'].items()}
+            weights = batch['weight'].to(device) if 'weight' in batch else None
 
             should_sync = (i + 1) % accumulation_steps == 0 or (i + 1) == len(train_loader)
 
             with autocast(device_type='cuda', dtype=torch.bfloat16, enabled=True):
-                anchor_embeddings = model(anchor_inputs['input_ids'], anchor_inputs['attention_mask'])
-                positive_embeddings = model(positive_inputs['input_ids'], positive_inputs['attention_mask'])
-                negative_embeddings = model(negative_inputs['input_ids'], negative_inputs['attention_mask'])
+                anchor = model(anchor_inputs['input_ids'], anchor_inputs['attention_mask'])
+                positive = model(positive_inputs['input_ids'], positive_inputs['attention_mask'])
+                negative = model(negative_inputs['input_ids'], negative_inputs['attention_mask'])
 
-                if epoch > 3 and random.random() < 0.3:
-                    all_embeddings = torch.cat([anchor_embeddings, positive_embeddings], dim=0)
-                    batch_size = anchor_embeddings.size(0)
-                    labels = torch.cat([
-                        torch.arange(batch_size, device=device),
-                        torch.arange(batch_size, device=device)
-                    ])
+                loss = criterion(anchor, positive, negative, weights)
 
-                    pos_dist, neg_dist = criterion.batch_hard_mining(all_embeddings, labels)
-                    pos_dist = pos_dist[:batch_size]
-                    neg_dist = neg_dist[:batch_size]
+                if epoch > 2 and random.random() < 0.3:
+                    alpha = torch.rand(anchor.size(0), 1, device=device)
+                    mix = F.normalize(alpha * anchor + (1 - alpha) * positive, p=2, dim=-1)
+                    mix_loss = criterion(mix, positive, negative)
+                    loss = 0.7 * loss + 0.3 * mix_loss
 
-                    hard_loss = F.relu(pos_dist - neg_dist + current_margin).mean()
-
-                    regular_loss = criterion(anchor_embeddings, positive_embeddings, negative_embeddings, weights)
-                    loss = 0.7 * regular_loss + 0.3 * hard_loss
-                else:
-                    loss = criterion(anchor_embeddings, positive_embeddings, negative_embeddings, weights)
+                if epoch > 2 and random.random() < 0.3:
+                    info_nce = criterion.forward_info_nce(anchor, positive)
+                    loss = 0.5 * loss + 0.5 * info_nce
 
                 loss = loss / accumulation_steps
-
-            if epoch > 2 and random.random() < 0.3:
-                alpha = torch.rand(anchor_embeddings.size(0), 1, device=device)
-                mixup = F.normalize(alpha * anchor_embeddings + (1 - alpha) * positive_embeddings, p=2, dim=-1)
-                mixup_loss = criterion(mixup, positive_embeddings, negative_embeddings)
-                loss = 0.7 * loss + 0.3 * mixup_loss
 
             if world_size > 1 and not should_sync:
                 with model.no_sync():
@@ -342,14 +305,12 @@ def run_training_loop(rank, world_size, model, tokenizer, train_dataset, train_l
 
             if should_sync:
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
-
-                if torch.isnan(grad_norm) or grad_norm > 10.0:
-                    if is_main_process:
-                        logger.warning(f"Large gradient norm detected: {grad_norm:.4f}, skipping step")
-                    optimizer.zero_grad()
-                else:
+                if not (torch.isnan(grad_norm) or grad_norm > 10.0):
                     optimizer.step()
                     scheduler.step()
+                    optimizer.zero_grad()
+                    update_momentum_model(model, momentum_model, m=0.995)
+                else:
                     optimizer.zero_grad()
 
             batch_loss = loss.item() * accumulation_steps
@@ -361,32 +322,16 @@ def run_training_loop(rank, world_size, model, tokenizer, train_dataset, train_l
                 current_lr = scheduler.get_last_lr()[0]
                 recent_loss = sum(batch_losses[-10:]) / min(10, len(batch_losses))
                 progress_bar.set_description(
-                    f"Epoch {epoch + 1}/{num_epochs}, "
-                    f"Loss: {recent_loss:.4f}, "
-                    f"LR: {current_lr:.2e}, "
+                    f"Epoch {epoch + 1}/{num_epochs}, Loss: {recent_loss:.4f}, LR: {current_lr:.2e}, "
                     f"Margin: {current_margin:.3f}"
                 )
 
-            if (i + 1) % 100 == 0:
-                empty_cache()
-
-        if len(train_loader) % accumulation_steps != 0:
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
-            if not (torch.isnan(grad_norm) or grad_norm > 10.0):
-                optimizer.step()
-                scheduler.step()
-            optimizer.zero_grad()
-
-        epoch_time = time.time() - epoch_start_time
-        avg_train_loss = running_loss / num_batches if num_batches > 0 else 0
-
+        avg_train_loss = running_loss / num_batches
         loss_history.append(avg_train_loss)
 
         if len(loss_history) > 5:
-            recent_trend = sum(loss_history[-3:]) / 3 - sum(loss_history[-6:-3]) / 3
-            if recent_trend > 0.1 and epoch > 5:
-                if is_main_process:
-                    logger.warning(f"Loss trend increasing: {recent_trend:.4f}, reducing learning rate")
+            trend = sum(loss_history[-3:]) / 3 - sum(loss_history[-6:-3]) / 3
+            if trend > 0.1 and epoch > 5:
                 for param_group in optimizer.param_groups:
                     param_group['lr'] *= 0.8
 
@@ -397,111 +342,62 @@ def run_training_loop(rank, world_size, model, tokenizer, train_dataset, train_l
             patience_counter += 1
 
         if patience_counter >= patience:
-            if is_main_process:
-                logger.info(f"Early stopping triggered at epoch {epoch + 1}")
             break
 
         if writer:
             writer.add_scalar("Loss/Train", avg_train_loss, epoch)
             writer.add_scalar("Learning_Rate", scheduler.get_last_lr()[0], epoch)
-            writer.add_scalar("Time/Epoch", epoch_time, epoch)
+            writer.add_scalar("Time/Epoch", time.time() - epoch_start_time, epoch)
             writer.add_scalar("Margin", current_margin, epoch)
 
-        if is_main_process:
-            logger.info(
-                f"Epoch {epoch + 1}/{num_epochs}, Train Avg Loss: {avg_train_loss:.4f}, "
-                f"Time: {epoch_time:.2f}s, Samples/sec: {len(train_dataset) / epoch_time:.1f}, "
-                f"Margin: {current_margin:.3f}, Patience: {patience_counter}/{patience}")
-
-            if test_loader is not None and (epoch + 1) % 3 == 0:
-                model.eval()
-                test_loss = 0.0
-                test_batches = 0
-
-                with torch.no_grad():
-                    for batch in test_loader:
-                        anchor_inputs = {k: v.to(device, non_blocking=True) for k, v in batch['anchor'].items()}
-                        positive_inputs = {k: v.to(device, non_blocking=True) for k, v in batch['positive'].items()}
-                        negative_inputs = {k: v.to(device, non_blocking=True) for k, v in batch['negative'].items()}
-
-                        with autocast(device_type='cuda', dtype=torch.bfloat16, enabled=True):
-                            anchor_embeddings = model(anchor_inputs['input_ids'], anchor_inputs['attention_mask'])
-                            positive_embeddings = model(positive_inputs['input_ids'], positive_inputs['attention_mask'])
-                            negative_embeddings = model(negative_inputs['input_ids'], negative_inputs['attention_mask'])
-
-                            loss = criterion(anchor_embeddings, positive_embeddings, negative_embeddings)
-
-                        test_loss += loss.item()
-                        test_batches += 1
-
-                avg_test_loss = test_loss / test_batches if test_batches > 0 else 0
-
-                all_anchors = []
-                all_positives = []
-
+        if is_main_process and test_loader is not None and (epoch + 1) % 3 == 0:
+            model.eval()
+            all_anchors, all_positives = [], []
+            with torch.no_grad():
                 for batch in test_loader:
-                    anchor_inputs = {k: v.to(device) for k, v in batch["anchor"].items()}
-                    positive_inputs = {k: v.to(device) for k, v in batch["positive"].items()}
+                    anchor_inputs = {k: v.to(device) for k, v in batch['anchor'].items()}
+                    positive_inputs = {k: v.to(device) for k, v in batch['positive'].items()}
+                    anchor_embed = model(anchor_inputs['input_ids'], anchor_inputs['attention_mask'])
+                    positive_embed = model(positive_inputs['input_ids'], positive_inputs['attention_mask'])
+                    all_anchors.append(anchor_embed)
+                    all_positives.append(positive_embed)
 
-                    with autocast(device_type='cuda', dtype=torch.bfloat16, enabled=True):
-                        anchor_embeds = model(anchor_inputs["input_ids"], anchor_inputs["attention_mask"])
-                        positive_embeds = model(positive_inputs["input_ids"], positive_inputs["attention_mask"])
+            anchors = torch.cat(all_anchors, dim=0)
+            positives = torch.cat(all_positives, dim=0)
+            similarity = torch.matmul(anchors, positives.T)
+            ranks = similarity.argsort(dim=-1, descending=True)
 
-                    all_anchors.append(anchor_embeds)
-                    all_positives.append(positive_embeds)
+            recall_at_5 = recall_at_10 = mrr_total = 0
+            for i in range(anchors.size(0)):
+                position = (ranks[i] == i).nonzero(as_tuple=True)[0].item()
+                if position < 5:
+                    recall_at_5 += 1
+                if position < 10:
+                    recall_at_10 += 1
+                mrr_total += 1.0 / (position + 1)
 
-                anchors = torch.cat(all_anchors, dim=0)
-                positives = torch.cat(all_positives, dim=0)
+            N = anchors.size(0)
+            recall_at_5 /= N
+            recall_at_10 /= N
+            mrr_score = mrr_total / N
 
-                similarities = torch.matmul(anchors, positives.T)
-                ranks = similarities.argsort(dim=-1, descending=True)
+            logger.info(f"Test Results | R@5: {recall_at_5:.4f}, R@10: {recall_at_10:.4f}, MRR: {mrr_score:.4f}")
+            if writer:
+                writer.add_scalar("Metrics/Recall@5", recall_at_5, epoch)
+                writer.add_scalar("Metrics/Recall@10", recall_at_10, epoch)
+                writer.add_scalar("Metrics/MRR", mrr_score, epoch)
 
-                recall_at_5 = 0
-                recall_at_10 = 0
-                mrr_total = 0
-                N = anchors.size(0)
-
-                for i in range(N):
-                    rank_list = ranks[i]
-                    correct_index = i
-                    rank_position = (rank_list == correct_index).nonzero(as_tuple=True)[0].item()
-
-                    if rank_position < 5:
-                        recall_at_5 += 1
-                    if rank_position < 10:
-                        recall_at_10 += 1
-                    mrr_total += 1.0 / (rank_position + 1)
-
-                recall_at_5 /= N
-                recall_at_10 /= N
-                mrr_score = mrr_total / N
-
-                logger.info(
-                    f"Epoch {epoch + 1}/{num_epochs}, Test Loss: {avg_test_loss:.4f}, "
-                    f"Recall@5: {recall_at_5:.4f}, Recall@10: {recall_at_10:.4f}, MRR: {mrr_score:.4f}")
-
-                if writer:
-                    writer.add_scalar("Loss/Test", avg_test_loss, epoch)
-                    writer.add_scalar("Metrics/Recall@5", recall_at_5, epoch)
-                    writer.add_scalar("Metrics/Recall@10", recall_at_10, epoch)
-                    writer.add_scalar("Metrics/MRR", mrr_score, epoch)
-
-        if (epoch + 1) % 2 == 0:
+        if (epoch + 1) % 2 == 0 and is_main_process:
             save_checkpoint(model, optimizer, scheduler, epoch + 1, checkpoint_dir, rank)
 
-        if rank == 0 and (epoch + 1) % 20 == 0:
-            empty_cache()
-
     if is_main_process:
-        model_to_save = model.module.encoder if hasattr(model, "module") else model.encoder
-        final_save_path = f"./results/finetuned-albertina-1b5-triplet-loss-dataset-{dataset_id}"
-        os.makedirs(final_save_path, exist_ok=True)
-        model_to_save.save_pretrained(final_save_path)
-        tokenizer.save_pretrained(final_save_path)
-        logger.info(f"✅ Model and tokenizer saved to {final_save_path}")
-
-    if writer:
-        writer.close()
+        final_path = f"./results/finetuned-albertina-1b5-triplet-loss-dataset-{dataset_id}"
+        os.makedirs(final_path, exist_ok=True)
+        model.module.encoder.save_pretrained(final_path)
+        tokenizer.save_pretrained(final_path)
+        logger.info(f"✅ Model and tokenizer saved to {final_path}")
+        if writer:
+            writer.close()
 
 
 def main():

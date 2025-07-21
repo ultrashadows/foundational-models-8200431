@@ -485,7 +485,7 @@ def main():
 
 if __name__ == "__main__":
     analyzer = GPUTripletMarginAnalyzer(
-        dataset_path="datasets/dataset_3.json",
+        dataset_path="datasets/dataset_1.json",
         batch_size=16,
         max_length=512
     )

@@ -7,25 +7,18 @@ from tqdm import tqdm
 
 
 class DatasetProcessor(Dataset):
-    def __init__(self, tokenizer, split: str, max_length: int, dataset: str, hard_negatives=True):
-        assert split in {"train", "test"}, f"Invalid split: {split}"
-
+    def __init__(self, tokenizer, split, max_length, dataset, hard_negatives=True):
+        assert split in {"train", "test"}
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.dataset_path = os.path.join("datasets", dataset)
         self.hard_negatives = hard_negatives
 
-        if not os.path.isfile(self.dataset_path):
-            raise FileNotFoundError(f"Dataset file not found: {self.dataset_path}")
-
         with open(self.dataset_path, "r", encoding="utf-8") as f:
             all_samples = json.load(f)
 
         split_index = int(0.8 * len(all_samples))
-        if split == "train":
-            self.samples = all_samples[:split_index]
-        else:
-            self.samples = all_samples[split_index:]
+        self.samples = all_samples[:split_index] if split == "train" else all_samples[split_index:]
 
         self.negative_pool = []
         for sample in self.samples:
@@ -46,17 +39,15 @@ class DatasetProcessor(Dataset):
 
     def __getitem__(self, idx):
         item = self.samples[idx]
-
         anchor_text = item["question"]
-        positive_text = item["positive"]
+        positive_text = item.get("hard_positive", item["positive"])
 
-        negative_selection_strategy = random.random()
-
-        if self.hard_negatives and self.hard_negative_texts is not None and negative_selection_strategy < 0.4:
+        rand = random.random()
+        if self.hard_negatives and self.hard_negative_texts and rand < 0.4:
             negative_text = self.hard_negative_texts[idx]
-        elif self.hard_negatives and self.semi_hard_negative_texts is not None and negative_selection_strategy < 0.7:
+        elif self.hard_negatives and self.semi_hard_negative_texts and rand < 0.7:
             negative_text = self.semi_hard_negative_texts[idx]
-        elif self.hard_negatives and negative_selection_strategy < 0.85:
+        elif self.hard_negatives and rand < 0.85:
             negative_text = random.choice(self.negative_pool)
         else:
             negative_text = item["negative"]
@@ -68,32 +59,15 @@ class DatasetProcessor(Dataset):
         if random.random() < 0.03:
             negative_text = self._augment_text(negative_text)
 
-        anchor = self.tokenizer(
-            anchor_text,
-            padding="max_length",
-            truncation=True,
-            max_length=self.max_length,
-            return_tensors="pt"
-        )
-
-        positive = self.tokenizer(
-            positive_text,
-            padding="max_length",
-            truncation=True,
-            max_length=self.max_length,
-            return_tensors="pt"
-        )
-
-        negative = self.tokenizer(
-            negative_text,
-            padding="max_length",
-            truncation=True,
-            max_length=self.max_length,
-            return_tensors="pt"
-        )
+        anchor = self.tokenizer(anchor_text, padding="max_length", truncation=True, max_length=self.max_length,
+                                return_tensors="pt")
+        positive = self.tokenizer(positive_text, padding="max_length", truncation=True, max_length=self.max_length,
+                                  return_tensors="pt")
+        negative = self.tokenizer(negative_text, padding="max_length", truncation=True, max_length=self.max_length,
+                                  return_tensors="pt")
 
         sample_weight = 1.0
-        if self.difficulty_weights is not None:
+        if self.difficulty_weights:
             sample_weight = self.difficulty_weights[idx]
 
         return {
@@ -105,87 +79,70 @@ class DatasetProcessor(Dataset):
 
     def _augment_text(self, text):
         words = text.split()
-        if len(words) > 5:
-            augmentation_type = random.random()
-
-            if augmentation_type < 0.3:
-                num_to_remove = max(1, len(words) // 15)
-                indices_to_remove = random.sample(range(len(words)), min(num_to_remove, len(words) - 3))
-                words = [word for i, word in enumerate(words) if i not in indices_to_remove]
-            elif augmentation_type < 0.6:
-                if len(words) > 3:
-                    num_swaps = min(2, len(words) // 8)
-                    for _ in range(num_swaps):
-                        i, j = random.sample(range(len(words)), 2)
-                        words[i], words[j] = words[j], words[i]
-            else:
-                synonyms = {"good": "great", "bad": "poor", "big": "large", "small": "tiny", "fast": "quick",
-                            "slow": "sluggish"}
-                words = [synonyms.get(word.lower(), word) if random.random() < 0.1 else word for word in words]
-
+        if len(words) <= 5:
+            return text
+        t = random.random()
+        if t < 0.3:
+            num = max(1, len(words) // 15)
+            indices = random.sample(range(len(words)), min(num, len(words) - 3))
+            words = [w for i, w in enumerate(words) if i not in indices]
+        elif t < 0.6:
+            for _ in range(min(2, len(words) // 8)):
+                i, j = random.sample(range(len(words)), 2)
+                words[i], words[j] = words[j], words[i]
+        else:
+            synonyms = {"good": "great", "bad": "poor", "big": "large", "small": "tiny"}
+            words = [synonyms.get(w.lower(), w) if random.random() < 0.1 else w for w in words]
         return " ".join(words)
 
     def embed_texts(self, texts, model, tokenizer, device, batch_size=16):
         model.eval()
         embeddings = []
-
         with torch.no_grad():
             for i in tqdm(range(0, len(texts), batch_size), desc="Embedding texts"):
                 batch = texts[i:i + batch_size]
                 encoded = tokenizer(batch, padding=True, truncation=True, max_length=self.max_length,
-                                    return_tensors="pt")
-                input_ids = encoded["input_ids"].to(device)
-                attention_mask = encoded["attention_mask"].to(device)
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                                    return_tensors="pt").to(device)
+                outputs = model(**encoded)
                 embeddings.append(outputs.cpu())
-
         return torch.cat(embeddings, dim=0)
 
     def precompute_hard_negatives(self, model, tokenizer, device):
-        all_anchor_texts = [sample["question"] for sample in self.samples]
-        anchor_embeddings = self.embed_texts(all_anchor_texts, model, tokenizer, device)
-        negative_pool_embeddings = self.embed_texts(self.negative_pool, model, tokenizer, device)
+        anchors = [s["question"] for s in self.samples]
+        positives = [s["positive"] for s in self.samples]
 
-        sim_matrix = torch.matmul(anchor_embeddings, negative_pool_embeddings.T)
+        anchor_embs = self.embed_texts(anchors, model, tokenizer, device)
+        positive_embs = self.embed_texts(positives, model, tokenizer, device)
+        negative_pool_embs = self.embed_texts(self.negative_pool, model, tokenizer, device)
 
+        sim_matrix = torch.matmul(anchor_embs, negative_pool_embs.T)
         sorted_indices = sim_matrix.argsort(dim=1, descending=True)
 
         hard_neg_indices = sorted_indices[:, 0]
-        semi_hard_start = max(1, sim_matrix.size(1) // 4)
-        semi_hard_end = min(sim_matrix.size(1), sim_matrix.size(1) // 2)
+        semi_hard_range = torch.randint(sim_matrix.size(1) // 4, sim_matrix.size(1) // 2, (len(self.samples),))
+        semi_hard_indices = sorted_indices[torch.arange(len(self.samples)), semi_hard_range]
 
-        semi_hard_range = torch.randint(semi_hard_start, semi_hard_end, (len(all_anchor_texts),))
-        semi_hard_indices = sorted_indices[torch.arange(len(all_anchor_texts)), semi_hard_range]
+        mask = sim_matrix[torch.arange(len(self.samples)), hard_neg_indices] > 0.85
+        hard_neg_indices[mask] = torch.randint(0, len(self.negative_pool), (mask.sum(),))
 
         self.hard_negative_texts = [self.negative_pool[i] for i in hard_neg_indices]
         self.semi_hard_negative_texts = [self.negative_pool[i] for i in semi_hard_indices]
 
-        positive_texts = [sample["positive"] for sample in self.samples]
-        positive_embeddings = self.embed_texts(positive_texts, model, tokenizer, device)
-
-        pos_similarities = torch.sum(anchor_embeddings * positive_embeddings, dim=1)
-        hard_neg_similarities = sim_matrix[torch.arange(len(all_anchor_texts)), hard_neg_indices]
-
-        margins = pos_similarities - hard_neg_similarities
-        difficulty = torch.sigmoid(margins * 3)
-
-        self.difficulty_weights = difficulty.tolist()
+        pos_sims = torch.sum(anchor_embs * positive_embs, dim=1)
+        neg_sims = sim_matrix[torch.arange(len(self.samples)), hard_neg_indices]
+        margins = pos_sims - neg_sims
+        self.difficulty_weights = torch.sigmoid(margins * 3).tolist()
 
     def precompute_hard_positives(self, model, tokenizer, device):
-        anchor_texts = [sample["question"] for sample in self.samples]
-        all_texts = list(set(self.negative_pool + anchor_texts))
-        anchor_embs = self.embed_texts(anchor_texts, model, tokenizer, device)
+        anchors = [s["question"] for s in self.samples]
+        all_texts = list(set(self.negative_pool + anchors))
+        anchor_embs = self.embed_texts(anchors, model, tokenizer, device)
         all_embs = self.embed_texts(all_texts, model, tokenizer, device)
-
         sim_matrix = torch.matmul(anchor_embs, all_embs.T)
         top_indices = sim_matrix.topk(3, dim=1).indices
-
-        for idx, sample in enumerate(self.samples):
-            hard_pos = None
-            for i in top_indices[idx]:
-                candidate = all_texts[i]
-                if candidate != sample["positive"] and candidate != sample["question"]:
-                    hard_pos = candidate
+        for i, s in enumerate(self.samples):
+            for j in top_indices[i]:
+                candidate = all_texts[j]
+                if candidate != s["positive"] and candidate != s["question"]:
+                    s["hard_positive"] = candidate
                     break
-            if hard_pos:
-                sample["hard_positive"] = hard_pos
