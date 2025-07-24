@@ -1,4 +1,5 @@
 import copy
+import math
 import os
 import logging
 import gc
@@ -204,28 +205,21 @@ def train_distributed(rank, world_size, num_epochs=10, start_index=1, num_datase
         ], betas=(0.9, 0.999), eps=1e-8)
 
         train_dataset = DatasetProcessor(tokenizer, split="train", max_length=512, dataset=dataset_name)
-        test_loader = None
 
         if num_epochs >= 3:
             train_dataset.precompute_hard_negatives(momentum_model, tokenizer, device)
             train_dataset.precompute_hard_positives(momentum_model, tokenizer, device)
 
-        train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True,
-                                           drop_last=True)
+        train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True)
         train_loader = DataLoader(train_dataset, batch_size=32, sampler=train_sampler, pin_memory=True,
                                   num_workers=32, persistent_workers=True, prefetch_factor=8, drop_last=True)
-
-        if rank == 0:
-            test_dataset = DatasetProcessor(tokenizer, split="test", max_length=512, dataset=dataset_name)
-            test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, pin_memory=True,
-                                     num_workers=16, persistent_workers=True, prefetch_factor=4, drop_last=False)
 
         total_steps = len(train_loader) * num_epochs
         scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=500, num_training_steps=total_steps)
 
         logger.info(f"Starting training on {dataset_name}")
-        run_training_loop(rank, world_size, model, momentum_model, tokenizer, train_dataset, train_loader, test_loader,
-                          train_sampler, num_epochs, 0, checkpoint_dir, optimizer, scheduler, dataset_id)
+        run_training_loop(rank, world_size, model, momentum_model, tokenizer, train_dataset, train_loader, train_sampler,
+                          num_epochs, 0, checkpoint_dir, optimizer, scheduler, dataset_id)
 
         if dist.is_initialized():
             dist.barrier()
@@ -235,12 +229,12 @@ def train_distributed(rank, world_size, num_epochs=10, start_index=1, num_datase
     dist.destroy_process_group()
 
 
-def run_training_loop(rank, world_size, model, momentum_model, tokenizer, train_dataset, train_loader, test_loader,
+def run_training_loop(rank, world_size, model, momentum_model, tokenizer, train_dataset, train_loader,
                       train_sampler, num_epochs, start_epoch, checkpoint_dir,
                       optimizer, scheduler, dataset_id):
     device = torch.device(f'cuda:{rank}')
-    initial_margin = 0.1
-    final_margin = 0.05
+    initial_margin = 0.16
+    final_margin = 0.11
     criterion = TripletLoss(margin=initial_margin, mining_strategy='adaptive')
     accumulation_steps = 8
     max_grad_norm = 0.5
@@ -260,8 +254,8 @@ def run_training_loop(rank, world_size, model, momentum_model, tokenizer, train_
         num_batches = 0
         epoch_start_time = time.time()
 
-        progress = epoch / num_epochs
-        current_margin = max(final_margin, initial_margin * (1 - progress))
+        cosine_decay = 0.5 * (1 + math.cos(math.pi * epoch / num_epochs))
+        current_margin = final_margin + (initial_margin - final_margin) * cosine_decay
         criterion.set_margin(current_margin)
 
         train_sampler.set_epoch(epoch)
@@ -349,43 +343,6 @@ def run_training_loop(rank, world_size, model, momentum_model, tokenizer, train_
             writer.add_scalar("Learning_Rate", scheduler.get_last_lr()[0], epoch)
             writer.add_scalar("Time/Epoch", time.time() - epoch_start_time, epoch)
             writer.add_scalar("Margin", current_margin, epoch)
-
-        if is_main_process and test_loader is not None and (epoch + 1) % 3 == 0:
-            model.eval()
-            all_anchors, all_positives = [], []
-            with torch.no_grad():
-                for batch in test_loader:
-                    anchor_inputs = {k: v.to(device) for k, v in batch['anchor'].items()}
-                    positive_inputs = {k: v.to(device) for k, v in batch['positive'].items()}
-                    anchor_embed = model(anchor_inputs['input_ids'], anchor_inputs['attention_mask'])
-                    positive_embed = model(positive_inputs['input_ids'], positive_inputs['attention_mask'])
-                    all_anchors.append(anchor_embed)
-                    all_positives.append(positive_embed)
-
-            anchors = torch.cat(all_anchors, dim=0)
-            positives = torch.cat(all_positives, dim=0)
-            similarity = torch.matmul(anchors, positives.T)
-            ranks = similarity.argsort(dim=-1, descending=True)
-
-            recall_at_5 = recall_at_10 = mrr_total = 0
-            for i in range(anchors.size(0)):
-                position = (ranks[i] == i).nonzero(as_tuple=True)[0].item()
-                if position < 5:
-                    recall_at_5 += 1
-                if position < 10:
-                    recall_at_10 += 1
-                mrr_total += 1.0 / (position + 1)
-
-            N = anchors.size(0)
-            recall_at_5 /= N
-            recall_at_10 /= N
-            mrr_score = mrr_total / N
-
-            logger.info(f"Test Results | R@5: {recall_at_5:.4f}, R@10: {recall_at_10:.4f}, MRR: {mrr_score:.4f}")
-            if writer:
-                writer.add_scalar("Metrics/Recall@5", recall_at_5, epoch)
-                writer.add_scalar("Metrics/Recall@10", recall_at_10, epoch)
-                writer.add_scalar("Metrics/MRR", mrr_score, epoch)
 
         if (epoch + 1) % 2 == 0 and is_main_process:
             save_checkpoint(model, optimizer, scheduler, epoch + 1, checkpoint_dir, rank)

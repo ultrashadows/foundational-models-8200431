@@ -16,7 +16,7 @@ FIRST_BATCH_SIZE = 2000
 NEXT_BATCH_SIZE = 1600
 OVERLAP_PERCENT = 0.2
 HARD_NEGATIVE_K = 5
-MARGIN = 0.2
+BASE_MARGIN = 0.2
 
 os.makedirs(DATASETS_DIR, exist_ok=True)
 model = SentenceTransformer('intfloat/multilingual-e5-base', device="cuda")
@@ -51,7 +51,7 @@ def find_best_and_worst_chunks_vectorized(
     correct_embeddings,
     wrong_embeddings,
     hard_negative_k=5,
-    margin=0.2,
+    base_margin=0.2,
     dataset_idx=1,
     item_index=None
 ):
@@ -61,37 +61,51 @@ def find_best_and_worst_chunks_vectorized(
     correct_scores = util.cos_sim(query_embedding, correct_embeddings)[0]
     wrong_scores = util.cos_sim(query_embedding, wrong_embeddings)[0]
 
-    topk = torch.topk(correct_scores, min(3, len(correct_scores)))
-    pos_idx = random.choice(topk.indices.tolist())
+    pos_idx = torch.topk(correct_scores, 1).indices[0].item()
     positive_sim = correct_scores[pos_idx].item()
     positive = correct_chunks[pos_idx]
 
-    hardness = min(0.3, 0.1 + 0.05 * (dataset_idx - 1))
-    lower = positive_sim - margin - hardness
-    upper = positive_sim - margin + hardness * 1.5
-    mask = (wrong_scores < positive_sim) & (wrong_scores >= lower) & (wrong_scores <= upper)
+    adaptive_margin = max(base_margin, min(base_margin + 0.01 * dataset_idx, 0.25))
+    lower = positive_sim - adaptive_margin - 0.05
+    upper = positive_sim - adaptive_margin + 0.05
 
+    mask = (wrong_scores < positive_sim) & (wrong_scores >= lower) & (wrong_scores <= upper)
     candidate_neg_indices = torch.where(mask)[0]
+
     best_idx = None
 
     if len(candidate_neg_indices) > 0:
         candidate_scores = wrong_scores[candidate_neg_indices]
         actual_margins = positive_sim - candidate_scores
-        abs_diff = torch.abs(actual_margins - margin)
+        abs_diff = torch.abs(actual_margins - adaptive_margin)
         best_idx = candidate_neg_indices[abs_diff.argmin()]
     else:
-        topk = min(hard_negative_k + dataset_idx, len(wrong_scores))
-        topk_indices = torch.topk(wrong_scores, k=topk, largest=True).indices
-        for idx in topk_indices:
-            if wrong_scores[idx].item() < 0.92:
-                best_idx = idx
-                break
+        semi_hard_margin = adaptive_margin - 0.05
+        alt_mask = (wrong_scores < positive_sim) & (wrong_scores >= (positive_sim - semi_hard_margin))
+        alt_neg_indices = torch.where(alt_mask)[0]
+        if len(alt_neg_indices) > 0:
+            best_idx = alt_neg_indices[torch.argmin(wrong_scores[alt_neg_indices])]
+        else:
+            topk = min(hard_negative_k + dataset_idx, len(wrong_scores))
+            topk_indices = torch.topk(wrong_scores, k=topk, largest=True).indices
+            for idx in topk_indices:
+                if wrong_scores[idx].item() < positive_sim:
+                    best_idx = idx
+                    break
 
     if best_idx is None:
-        min_idx = torch.argmin(wrong_scores).item()
-        best_idx = min_idx
+        sorted_scores, sorted_indices = torch.sort(wrong_scores)
+
+        cutoff = max(3, len(sorted_indices) // 4)
+        candidate_indices = sorted_indices[:cutoff]
+
+        if len(candidate_indices) > 1:
+            best_idx = random.choice(candidate_indices[1:])
+        else:
+            best_idx = sorted_indices[0]
+
         if item_index is not None:
-            print(f"⚠️ [Fallback] No suitable negative — using weakest available for item {item_index}")
+            print(f"⚠️ [Soft Fallback] No margin-fit negative — used easier fallback for item {item_index}")
 
     negative = wrong_chunks[best_idx]
     return positive, negative
@@ -183,7 +197,7 @@ def process_batch(batch_objects: List[Dict], prev_triplets: List[Dict], dataset_
             obj_correct_embeddings,
             obj_wrong_embeddings,
             hard_negative_k=HARD_NEGATIVE_K,
-            margin=MARGIN,
+            base_margin=BASE_MARGIN,
             dataset_idx=dataset_idx,
             item_index=i
         )
@@ -200,9 +214,25 @@ def process_batch(batch_objects: List[Dict], prev_triplets: List[Dict], dataset_
         })
 
     if prev_triplets:
+        print(f"[# {dataset_idx}] Selecting best overlap triplets...")
         overlap_count = int(OVERLAP_PERCENT * len(prev_triplets))
         if overlap_count > 0:
-            triplets += random.sample(prev_triplets, min(overlap_count, len(prev_triplets)))
+            triplet_texts = [(f"query: {t['question']}", f"passage: {t['positive']}", f"passage: {t['negative']}") for t
+                             in prev_triplets]
+
+            anchor_embs = model.encode([t[0] for t in triplet_texts], convert_to_tensor=True, show_progress_bar=False)
+            pos_embs = model.encode([t[1] for t in triplet_texts], convert_to_tensor=True, show_progress_bar=False)
+            neg_embs = model.encode([t[2] for t in triplet_texts], convert_to_tensor=True, show_progress_bar=False)
+
+            pos_sims = util.cos_sim(anchor_embs, pos_embs).diagonal()
+            neg_sims = util.cos_sim(anchor_embs, neg_embs).diagonal()
+            margins = neg_sims - pos_sims
+
+            ideal_margin = 0.2
+            margin_dist = torch.abs(margins - ideal_margin)
+            best_indices = torch.topk(-margin_dist, overlap_count).indices
+
+            triplets += [prev_triplets[i] for i in best_indices]
 
     print(f"[# {dataset_idx}] Created {len(triplets)} triplets, skipped {skipped_triplets} due to filtering.")
     output_file = os.path.join(DATASETS_DIR, f"dataset_{dataset_idx}.json")
@@ -219,8 +249,14 @@ def main():
     total_docs = len(all_data)
 
     dataset_idx = get_last_dataset_index() + 1
-    current_index = 0
+    current_index = (FIRST_BATCH_SIZE if dataset_idx > 1 else 0) + (dataset_idx - 2) * NEXT_BATCH_SIZE
+
     prev_triplets = []
+    if dataset_idx > 1:
+        prev_file = os.path.join(DATASETS_DIR, f"dataset_{dataset_idx - 1}.json")
+        if os.path.exists(prev_file):
+            with open(prev_file, "r", encoding="utf-8") as f:
+                prev_triplets = json.load(f)
 
     while current_index < total_docs:
         batch_size = FIRST_BATCH_SIZE if dataset_idx == 1 else NEXT_BATCH_SIZE
