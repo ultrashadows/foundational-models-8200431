@@ -4,6 +4,7 @@ import json
 import os
 import re
 import pickle
+import ijson
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
 from threading import Lock
@@ -18,9 +19,9 @@ logger = logging.getLogger(__name__)
 
 class CacheProcessor(Dataset):
     def __init__(self, tokenizer=None, max_length=512, split="train", train_ratio=0.8, max_samples=None,
-                 seed=42, json_path="dataset.json", chunk_overlap=50, use_chunking_threshold=400,
-                 max_chunks_per_sample=2, min_chunk_tokens=100, preserve_structure=True,
-                 cache_dir="cache", enable_cache=True, num_workers=4, batch_size=100):
+                 seed=42, json_path="dataset.json", pool_path="pool.json", chunk_overlap=50,
+                 use_chunking_threshold=400, max_chunks_per_sample=2, min_chunk_tokens=100,
+                 preserve_structure=True, cache_dir="cache", enable_cache=True, num_workers=4, batch_size=100):
         logger.info(f"Initializing Enhanced HybridDatasetProcessor with split='{split}', max_samples={max_samples}")
         self.tokenizer = AutoTokenizer.from_pretrained("./models/albertina-1b5") if tokenizer is None else tokenizer
         self.max_length = max_length
@@ -50,6 +51,17 @@ class CacheProcessor(Dataset):
             'errors': 0
         }
 
+        self.pool_path = pool_path
+        self.pool_doc_map = {}
+
+        with open(self.pool_path, 'r', encoding='utf-8') as f:
+            index = 1
+            for obj in ijson.items(f, 'item'):
+                doc_id = self._extract_id(obj['_id'])
+                print(index)
+                index += 1
+                self.pool_doc_map[doc_id] = obj
+
         self.legal_patterns = self._init_legal_patterns()
 
         if self.enable_cache:
@@ -58,8 +70,41 @@ class CacheProcessor(Dataset):
         self.samples = self._process_dataset(json_path, split, train_ratio, max_samples, seed)
         logger.info(f"Dataset ready with {len(self.samples)} samples")
 
+    def _load_pool_data_optimized(self):
+        cache_file = f"{self.pool_path}.cache.pkl"
+
+        if (os.path.exists(cache_file) and
+                os.path.getmtime(cache_file) > os.path.getmtime(self.pool_path)):
+            logger.info("Loading from cache...")
+            with open(cache_file, 'rb') as f:
+                self.pool_doc_map = pickle.load(f)
+            logger.info(f"Loaded {len(self.pool_doc_map)} documents from cache")
+            return
+
+        logger.info("Parsing JSON file...")
+        self.pool_doc_map = {}
+
+        with open(self.pool_path, 'r', encoding='utf-8') as f:
+            for line_num, line in enumerate(f, 1):
+                if line.strip():
+                    try:
+                        obj = json.loads(line)
+                        doc_id = self._extract_id(obj['_id'])
+                        self.pool_doc_map[doc_id] = obj
+                    except json.JSONDecodeError:
+                        continue
+
+                if line_num % 50000 == 0:
+                    logger.info(f"Processed {line_num} documents...")
+
+        logger.info("Caching results...")
+        with open(cache_file, 'wb') as f:
+            pickle.dump(self.pool_doc_map, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+        logger.info(f"Loaded {len(self.pool_doc_map)} documents")
+
     @classmethod
-    def preprocess_only(cls, json_path: str, cache_dir: str = "cache", max_length: int = 512,
+    def preprocess_only(cls, json_path: str, pool_path: str, cache_dir: str = "cache", max_length: int = 512,
                         chunk_overlap: int = 50, use_chunking_threshold: int = 400,
                         max_chunks_per_sample: int = 2, min_chunk_tokens: int = 100,
                         preserve_structure: bool = True, force_refresh: bool = False,
@@ -75,6 +120,7 @@ class CacheProcessor(Dataset):
             max_samples=None,
             seed=42,
             json_path=json_path,
+            pool_path=pool_path,
             chunk_overlap=chunk_overlap,
             use_chunking_threshold=use_chunking_threshold,
             max_chunks_per_sample=max_chunks_per_sample,
@@ -197,13 +243,11 @@ class CacheProcessor(Dataset):
         with open(self.json_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
 
-        doc_map = {self._extract_id(doc['_id']): doc for doc in data}
-
         doc_pairs = []
         for doc in data:
             if 'results' in doc and isinstance(doc['results'], list) and doc.get('wrong'):
                 wrong_id = doc['wrong']['$oid']
-                wrong_doc = doc_map.get(wrong_id)
+                wrong_doc = self.pool_doc_map.get(wrong_id)
                 if wrong_doc:
                     doc_pairs.append((doc, wrong_doc))
 
@@ -225,8 +269,6 @@ class CacheProcessor(Dataset):
             for future in as_completed(future_to_batch):
                 batch_idx = future_to_batch[future]
                 try:
-                    batch_results = future.result()
-
                     if (batch_idx + 1) % 10 == 0:
                         with self.progress_lock:
                             current_stats = self.progress_stats.copy()
@@ -247,14 +289,14 @@ class CacheProcessor(Dataset):
                     f"{final_stats['cache_hits']} cache hits, {final_stats['new_processed']} newly processed, "
                     f"{final_stats['errors']} errors")
 
-    def _process_dataset_parallel(self, data: List[Dict], doc_map: Dict[str, Dict]) -> List[Dict[str, str]]:
+    def _process_dataset_parallel(self, data: List[Dict]) -> List[Dict[str, str]]:
         logger.info(f"Processing dataset with {self.num_workers} workers...")
 
         doc_pairs = []
         for doc in data:
             if 'results' in doc and isinstance(doc['results'], list) and doc.get('wrong'):
                 wrong_id = doc['wrong']['$oid']
-                wrong_doc = doc_map.get(wrong_id)
+                wrong_doc = self.pool_doc_map.get(wrong_id)
                 if wrong_doc:
                     doc_pairs.append((doc, wrong_doc))
 
@@ -602,9 +644,7 @@ class CacheProcessor(Dataset):
         with open(json_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
 
-        doc_map = {self._extract_id(doc['_id']): doc for doc in data}
-
-        all_samples = self._process_dataset_parallel(data, doc_map)
+        all_samples = self._process_dataset_parallel(data)
 
         logger.info(f"Total samples before split/filtering: {len(all_samples)}")
 
@@ -709,6 +749,7 @@ class CacheProcessor(Dataset):
 if __name__ == "__main__":
     dataset_processor = CacheProcessor.preprocess_only(
         json_path='dataset.json',
+        pool_path='pool.json',
         cache_dir='cache',
         force_refresh=False,
         num_workers=16,

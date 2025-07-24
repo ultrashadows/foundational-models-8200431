@@ -13,7 +13,7 @@ warnings.filterwarnings("ignore")
 
 
 class GPUTripletMarginAnalyzer:
-    def __init__(self, dataset_path: str, model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+    def __init__(self, dataset_path: str, model_name: str = "sentence-transformers/paraphrase-mpnet-base-v2",
                  batch_size: int = 32, max_length: int = 512, device: Optional[str] = None):
         """
         Initialize the analyzer with GPU acceleration and efficient processing.
@@ -459,7 +459,7 @@ def main():
     parser = argparse.ArgumentParser(
         description='GPU-accelerated triplet dataset analysis for optimal TripletLoss margin')
     parser.add_argument('dataset_path', help='Path to the JSON file containing triplets')
-    parser.add_argument('--model', default='sentence-transformers/all-MiniLM-L6-v2',
+    parser.add_argument('--model', default='paraphrase-mpnet-base-v2',
                         help='HuggingFace model name for embeddings')
     parser.add_argument('--batch-size', type=int, default=32,
                         help='Batch size for processing (adjust for GPU memory)')

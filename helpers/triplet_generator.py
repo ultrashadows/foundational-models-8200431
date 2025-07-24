@@ -50,8 +50,9 @@ def find_best_and_worst_chunks_vectorized(
     wrong_chunks,
     correct_embeddings,
     wrong_embeddings,
-    hard_negative_k=HARD_NEGATIVE_K,
-    margin=MARGIN,
+    hard_negative_k=5,
+    margin=0.2,
+    dataset_idx=1,
     item_index=None
 ):
     if len(correct_chunks) == 0 or len(wrong_chunks) == 0:
@@ -60,34 +61,39 @@ def find_best_and_worst_chunks_vectorized(
     correct_scores = util.cos_sim(query_embedding, correct_embeddings)[0]
     wrong_scores = util.cos_sim(query_embedding, wrong_embeddings)[0]
 
-    best_pos_idx = correct_scores.argmax().item()
-    positive_sim = correct_scores[best_pos_idx].item()
-    positive = correct_chunks[best_pos_idx]
+    topk = torch.topk(correct_scores, min(3, len(correct_scores)))
+    pos_idx = random.choice(topk.indices.tolist())
+    positive_sim = correct_scores[pos_idx].item()
+    positive = correct_chunks[pos_idx]
 
-    mask = (wrong_scores < positive_sim) & (wrong_scores > positive_sim - 0.5)
+    hardness = min(0.3, 0.1 + 0.05 * (dataset_idx - 1))
+    lower = positive_sim - margin - hardness
+    upper = positive_sim - margin + hardness * 1.5
+    mask = (wrong_scores < positive_sim) & (wrong_scores >= lower) & (wrong_scores <= upper)
 
     candidate_neg_indices = torch.where(mask)[0]
+    best_idx = None
 
-    if len(candidate_neg_indices) == 0:
-        topk = min(hard_negative_k, len(wrong_scores))
-        topk_indices = torch.topk(wrong_scores, k=topk, largest=True).indices
-        if len(topk_indices) == 0:
-            return None, None
-
-        if item_index is not None:
-            print(f"⚠️ [Warning] No semi-hard negative found for item {item_index}. "
-                  f"Using top-k hardest negative fallback.")
-
-        neg_idx = topk_indices[0].item()
-    else:
+    if len(candidate_neg_indices) > 0:
         candidate_scores = wrong_scores[candidate_neg_indices]
         actual_margins = positive_sim - candidate_scores
         abs_diff = torch.abs(actual_margins - margin)
         best_idx = candidate_neg_indices[abs_diff.argmin()]
-        neg_idx = best_idx.item()
+    else:
+        topk = min(hard_negative_k + dataset_idx, len(wrong_scores))
+        topk_indices = torch.topk(wrong_scores, k=topk, largest=True).indices
+        for idx in topk_indices:
+            if wrong_scores[idx].item() < 0.92:
+                best_idx = idx
+                break
 
-    negative = wrong_chunks[neg_idx]
+    if best_idx is None:
+        min_idx = torch.argmin(wrong_scores).item()
+        best_idx = min_idx
+        if item_index is not None:
+            print(f"⚠️ [Fallback] No suitable negative — using weakest available for item {item_index}")
 
+    negative = wrong_chunks[best_idx]
     return positive, negative
 
 
@@ -102,8 +108,8 @@ def process_batch(batch_objects: List[Dict], prev_triplets: List[Dict], dataset_
     all_wrong_chunks = set()
     object_data = []
 
-    print(f"[#{dataset_idx}] Collecting data from batch ({len(batch_objects)} docs)...")
-    for obj in tqdm(batch_objects, desc=f"[#{dataset_idx}] Collecting data"):
+    print(f"[# {dataset_idx}] Collecting data from batch ({len(batch_objects)} docs)...")
+    for obj in tqdm(batch_objects, desc=f"[# {dataset_idx}] Collecting data"):
         oid = obj["_id"]["$oid"]
         try:
             cache = load_cache(oid)
@@ -132,10 +138,10 @@ def process_batch(batch_objects: List[Dict], prev_triplets: List[Dict], dataset_
             })
 
     if not object_data:
-        print(f"[#{dataset_idx}] ❌ No valid objects to process.")
+        print(f"[# {dataset_idx}] ❌ No valid objects to process.")
         return []
 
-    print(f"[#{dataset_idx}] Precomputing embeddings for chunks...")
+    print(f"[# {dataset_idx}] Precomputing embeddings for chunks...")
     all_correct_chunks = list(all_correct_chunks)
     all_wrong_chunks = list(all_wrong_chunks)
 
@@ -156,8 +162,8 @@ def process_batch(batch_objects: List[Dict], prev_triplets: List[Dict], dataset_
     triplets = []
     skipped_triplets = 0
 
-    print(f"[#{dataset_idx}] Generating triplets...")
-    for i, data in enumerate(tqdm(object_data, desc=f"[#{dataset_idx}] Triplet generation")):
+    print(f"[# {dataset_idx}] Generating triplets...")
+    for i, data in enumerate(tqdm(object_data, desc=f"[# {dataset_idx}] Triplet generation")):
         query_embedding = query_embeddings[i:i + 1]
 
         correct_indices = [correct_chunk_to_idx[chunk] for chunk in data["correct_chunks"] if chunk in correct_chunk_to_idx]
@@ -178,6 +184,7 @@ def process_batch(batch_objects: List[Dict], prev_triplets: List[Dict], dataset_
             obj_wrong_embeddings,
             hard_negative_k=HARD_NEGATIVE_K,
             margin=MARGIN,
+            dataset_idx=dataset_idx,
             item_index=i
         )
 
@@ -197,12 +204,12 @@ def process_batch(batch_objects: List[Dict], prev_triplets: List[Dict], dataset_
         if overlap_count > 0:
             triplets += random.sample(prev_triplets, min(overlap_count, len(prev_triplets)))
 
-    print(f"[#{dataset_idx}] Created {len(triplets)} triplets, skipped {skipped_triplets} due to filtering.")
+    print(f"[# {dataset_idx}] Created {len(triplets)} triplets, skipped {skipped_triplets} due to filtering.")
     output_file = os.path.join(DATASETS_DIR, f"dataset_{dataset_idx}.json")
     with open(output_file, "w", encoding="utf-8") as f:
         json.dump(triplets, f, ensure_ascii=False, indent=2)
 
-    print(f"[#{dataset_idx}] Saved triplets to {output_file}")
+    print(f"[# {dataset_idx}] Saved triplets to {output_file}")
     return triplets
 
 
