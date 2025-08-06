@@ -3,13 +3,11 @@ import math
 import os
 import logging
 import gc
-import random
 import warnings
 import time
 import psutil
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -155,11 +153,12 @@ def cleanup_old_checkpoints(checkpoint_dir, keep_last=3):
 
 
 def update_momentum_model(model, momentum_model, m=0.995):
-    for param_q, param_k in zip(model.parameters(), momentum_model.parameters()):
-        param_k.data = param_k.data * m + param_q.data * (1. - m)
+    with torch.no_grad():
+        for param_q, param_k in zip(model.parameters(), momentum_model.parameters()):
+            param_k.data.mul_(m).add_(param_q.data, alpha=1. - m)
 
 
-def train_distributed(rank, world_size, num_epochs=10, start_index=1, num_datasets=1):
+def train_distributed(rank, world_size, num_epochs=10, start_index=1, num_datasets=5):
     dist.init_process_group(backend='nccl')
     torch.cuda.set_device(rank)
     device = torch.device(f'cuda:{rank}')
@@ -200,22 +199,21 @@ def train_distributed(rank, world_size, num_epochs=10, start_index=1, num_datase
         encoder_params = [p for n, p in model.named_parameters() if "projection" not in n]
 
         optimizer = torch.optim.AdamW([
-            {"params": encoder_params, "weight_decay": 0.01, "lr": 1e-5},
-            {"params": projection_params, "weight_decay": 0.01, "lr": 3e-4}
+            {"params": encoder_params, "weight_decay": 0.01, "lr": 2e-5},
+            {"params": projection_params, "weight_decay": 0.01, "lr": 5e-4}
         ], betas=(0.9, 0.999), eps=1e-8)
 
-        train_dataset = DatasetProcessor(tokenizer, split="train", max_length=512, dataset=dataset_name)
+        train_dataset = DatasetProcessor(tokenizer, split="train", max_length=512, dataset=dataset_name, hard_negatives=False)
 
-        if num_epochs >= 3:
+        if num_epochs >= 3 and train_dataset.hard_negatives:
             train_dataset.precompute_hard_negatives(momentum_model, tokenizer, device)
-            train_dataset.precompute_hard_positives(momentum_model, tokenizer, device)
 
         train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True)
         train_loader = DataLoader(train_dataset, batch_size=32, sampler=train_sampler, pin_memory=True,
                                   num_workers=32, persistent_workers=True, prefetch_factor=8, drop_last=True)
 
         total_steps = len(train_loader) * num_epochs
-        scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=500, num_training_steps=total_steps)
+        scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=1500, num_training_steps=total_steps)
 
         logger.info(f"Starting training on {dataset_name}")
         run_training_loop(rank, world_size, model, momentum_model, tokenizer, train_dataset, train_loader, train_sampler,
@@ -234,18 +232,13 @@ def run_training_loop(rank, world_size, model, momentum_model, tokenizer, train_
                       optimizer, scheduler, dataset_id):
     device = torch.device(f'cuda:{rank}')
     initial_margin = 0.16
-    final_margin = 0.11
-    criterion = TripletLoss(margin=initial_margin, mining_strategy='adaptive')
-    accumulation_steps = 8
+    final_margin = 0.1
+    criterion = TripletLoss(margin=initial_margin, mining_strategy='adaptive', margin_scale=3.0, temperature=0.07, regularization_weight=0.05)
+    accumulation_steps = 4
     max_grad_norm = 0.5
 
     is_main_process = (rank == 0)
     writer = SummaryWriter(log_dir=f"./runs/albertina_triplet_dataset_{dataset_id}") if is_main_process else None
-
-    best_loss = float('inf')
-    patience_counter = 0
-    patience = 8
-    loss_history = []
 
     for epoch in range(start_epoch, num_epochs):
         model.train()
@@ -259,84 +252,71 @@ def run_training_loop(rank, world_size, model, momentum_model, tokenizer, train_
         criterion.set_margin(current_margin)
 
         train_sampler.set_epoch(epoch)
-        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs}") if is_main_process else train_loader
 
-        if epoch > 5 and epoch % 2 == 0:
+        if epoch > 2 and epoch % 2 == 0 and train_dataset.hard_negatives:
+            logger.info(f"[RANK {rank}] Recomputing hard negatives for epoch {epoch}")
             train_dataset.precompute_hard_negatives(momentum_model, tokenizer, device)
 
+            logger.info(f"[RANK {rank}] Rebuilding dataloader for new triplets...")
+            train_loader = DataLoader(train_dataset, batch_size=32, sampler=train_sampler, pin_memory=True,
+                                      num_workers=32, persistent_workers=True, prefetch_factor=8, drop_last=True)
+
+        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs}") if is_main_process else train_loader
+
         for i, batch in enumerate(progress_bar):
-            anchor_inputs = {k: v.to(device) for k, v in batch['anchor'].items()}
-            positive_inputs = {k: v.to(device) for k, v in batch['positive'].items()}
-            negative_inputs = {k: v.to(device) for k, v in batch['negative'].items()}
-            weights = batch['weight'].to(device) if 'weight' in batch else None
+            try:
+                anchor_inputs = {k: v.to(device) for k, v in batch['anchor'].items()}
+                positive_inputs = {k: v.to(device) for k, v in batch['positive'].items()}
+                negative_inputs = {k: v.to(device) for k, v in batch['negative'].items()}
+                weights = batch['weight'].to(device) if 'weight' in batch else None
 
-            should_sync = (i + 1) % accumulation_steps == 0 or (i + 1) == len(train_loader)
+                should_sync = (i + 1) % accumulation_steps == 0 or (i + 1) == len(train_loader)
 
-            with autocast(device_type='cuda', dtype=torch.bfloat16, enabled=True):
-                anchor = model(anchor_inputs['input_ids'], anchor_inputs['attention_mask'])
-                positive = model(positive_inputs['input_ids'], positive_inputs['attention_mask'])
-                negative = model(negative_inputs['input_ids'], negative_inputs['attention_mask'])
+                with autocast(device_type='cuda', dtype=torch.bfloat16, enabled=True):
+                    anchor = model(anchor_inputs['input_ids'], anchor_inputs['attention_mask'])
+                    positive = model(positive_inputs['input_ids'], positive_inputs['attention_mask'])
+                    negative = model(negative_inputs['input_ids'], negative_inputs['attention_mask'])
 
-                loss = criterion(anchor, positive, negative, weights)
+                    loss = criterion(anchor, positive, negative, weights)
 
-                if epoch > 2 and random.random() < 0.3:
-                    alpha = torch.rand(anchor.size(0), 1, device=device)
-                    mix = F.normalize(alpha * anchor + (1 - alpha) * positive, p=2, dim=-1)
-                    mix_loss = criterion(mix, positive, negative)
-                    loss = 0.7 * loss + 0.3 * mix_loss
+                    loss = loss / accumulation_steps
 
-                if epoch > 2 and random.random() < 0.3:
-                    info_nce = criterion.forward_info_nce(anchor, positive)
-                    loss = 0.5 * loss + 0.5 * info_nce
-
-                loss = loss / accumulation_steps
-
-            if world_size > 1 and not should_sync:
-                with model.no_sync():
-                    loss.backward()
-            else:
-                loss.backward()
-
-            if should_sync:
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
-                if not (torch.isnan(grad_norm) or grad_norm > 10.0):
-                    optimizer.step()
-                    scheduler.step()
-                    optimizer.zero_grad()
-                    update_momentum_model(model, momentum_model, m=0.995)
+                if world_size > 1 and not should_sync:
+                    with model.no_sync():
+                        loss.backward()
                 else:
-                    optimizer.zero_grad()
+                    loss.backward()
 
-            batch_loss = loss.item() * accumulation_steps
-            running_loss += batch_loss
-            batch_losses.append(batch_loss)
-            num_batches += 1
+                if should_sync:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                    if not (torch.isnan(grad_norm) or grad_norm > 5.0):
+                        optimizer.step()
+                        scheduler.step()
+                        optimizer.zero_grad()
+                        update_momentum_model(model, momentum_model, m=0.995)
+                    else:
+                        logger.warning(f"[RANK {rank}] Skipping step due to unstable grad norm: {grad_norm:.4f}")
+                        optimizer.zero_grad()
 
-            if is_main_process and isinstance(progress_bar, tqdm):
-                current_lr = scheduler.get_last_lr()[0]
-                recent_loss = sum(batch_losses[-10:]) / min(10, len(batch_losses))
-                progress_bar.set_description(
-                    f"Epoch {epoch + 1}/{num_epochs}, Loss: {recent_loss:.4f}, LR: {current_lr:.2e}, "
-                    f"Margin: {current_margin:.3f}"
-                )
+                batch_loss = loss.item() * accumulation_steps
+                running_loss += batch_loss
+                batch_losses.append(batch_loss)
+                num_batches += 1
+
+                if is_main_process and isinstance(progress_bar, tqdm):
+                    current_lr = scheduler.get_last_lr()[0]
+                    recent_loss = sum(batch_losses[-10:]) / min(10, len(batch_losses))
+                    progress_bar.set_description(
+                        f"Epoch {epoch + 1}/{num_epochs}, Loss: {recent_loss:.4f}, LR: {current_lr:.2e}, "
+                        f"Margin: {current_margin:.3f}"
+                    )
+
+            except Exception as e:
+                logger.warning(f"[RANK {rank}] Batch {i} skipped due to error: {e}")
+                optimizer.zero_grad()
+                continue
 
         avg_train_loss = running_loss / num_batches
-        loss_history.append(avg_train_loss)
-
-        if len(loss_history) > 5:
-            trend = sum(loss_history[-3:]) / 3 - sum(loss_history[-6:-3]) / 3
-            if trend > 0.1 and epoch > 5:
-                for param_group in optimizer.param_groups:
-                    param_group['lr'] *= 0.8
-
-        if avg_train_loss < best_loss - 0.001:
-            best_loss = avg_train_loss
-            patience_counter = 0
-        else:
-            patience_counter += 1
-
-        if patience_counter >= patience:
-            break
 
         if writer:
             writer.add_scalar("Loss/Train", avg_train_loss, epoch)

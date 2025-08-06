@@ -7,7 +7,7 @@ from tqdm import tqdm
 
 
 class DatasetProcessor(Dataset):
-    def __init__(self, tokenizer, split, max_length, dataset, hard_negatives=True, hard_negative_ratio=0.4, semi_hard_ratio=0.3, random_neg_ratio=0.15):
+    def __init__(self, tokenizer, split, max_length, dataset, hard_negatives=False, hard_negative_ratio=0.4, semi_hard_ratio=0.3, random_neg_ratio=0.15):
         assert split in {"train", "test"}
         self.tokenizer = tokenizer
         self.max_length = max_length
@@ -131,25 +131,45 @@ class DatasetProcessor(Dataset):
         negative_pool_embs = self.embed_texts(self.negative_pool, model, tokenizer, device)
 
         sim_matrix = torch.matmul(anchor_embs, negative_pool_embs.T)
-        hard_threshold = torch.quantile(sim_matrix, 0.95).item()
-        semi_hard_low = torch.quantile(sim_matrix, 0.70).item()
-        semi_hard_high = torch.quantile(sim_matrix, 0.85).item()
 
-        hard_neg_indices = sim_matrix.argmax(dim=1)
+        sorted_sims, sorted_indices = torch.sort(sim_matrix, dim=1, descending=True)
+
+        start_idx = int(sim_matrix.size(1) * 0.15)
+        end_idx = int(sim_matrix.size(1) * 0.40)
+
+        hard_neg_indices = []
+        for i in range(sim_matrix.size(0)):
+            if start_idx < end_idx < sorted_indices.size(1):
+                rand_idx = random.randint(start_idx, min(end_idx - 1, sorted_indices.size(1) - 1))
+                hard_neg_indices.append(sorted_indices[i, rand_idx].item())
+            else:
+                mid_idx = min(sorted_indices.size(1) // 3, sorted_indices.size(1) - 1)
+                hard_neg_indices.append(sorted_indices[i, mid_idx].item())
+
+        k_85 = max(1, int(sim_matrix.size(1) * 0.15))  # Top 15%
+        k_70 = max(1, int(sim_matrix.size(1) * 0.30))  # Top 30%
+
+        top_85, _ = torch.topk(sim_matrix, k=k_85, dim=1)
+        semi_threshold_high = top_85[:, -1]
+
+        top_70, _ = torch.topk(sim_matrix, k=k_70, dim=1)
+        semi_threshold_low = top_70[:, -1]
+
         semi_hard_indices = []
-
         for i in range(sim_matrix.size(0)):
             sims = sim_matrix[i]
-            mask = (sims > semi_hard_low) & (sims < semi_hard_high)
+            mask = (sims > semi_threshold_low[i]) & (sims < semi_threshold_high[i])
             candidates = torch.nonzero(mask).squeeze()
             if candidates.numel() > 0:
-                chosen = candidates[random.randint(0, len(candidates) - 1)]
+                if candidates.dim() == 0:
+                    chosen = candidates
+                else:
+                    chosen = candidates[random.randint(0, candidates.numel() - 1)]
             else:
-                chosen = random.randint(0, len(self.negative_pool) - 1)
+                sorted_sims_i, sorted_indices_i = torch.sort(sims, descending=True)
+                fallback_idx = min(len(sims) // 2, len(sims) - 1)
+                chosen = sorted_indices_i[fallback_idx]
             semi_hard_indices.append(chosen.item())
-
-        hard_neg_indices = hard_neg_indices.tolist()
-        semi_hard_indices = semi_hard_indices
 
         self.hard_negative_texts = [self.negative_pool[i] for i in hard_neg_indices]
         self.semi_hard_negative_texts = [self.negative_pool[i] for i in semi_hard_indices]
@@ -157,6 +177,8 @@ class DatasetProcessor(Dataset):
         pos_sims = torch.sum(anchor_embs * positive_embs, dim=1)
         neg_sims = sim_matrix[torch.arange(len(self.samples)), torch.tensor(hard_neg_indices)]
         margins = pos_sims - neg_sims
+
+        margins = torch.clamp(margins, min=-2.0, max=2.0)
         scale = 1 / (margins.std().item() + 1e-6)
         self.difficulty_weights = torch.sigmoid(margins * scale).tolist()
 
@@ -166,19 +188,7 @@ class DatasetProcessor(Dataset):
             'weights': self.difficulty_weights
         }, cache_path)
 
-    def precompute_hard_positives(self, model, tokenizer, device):
-        anchors = [s["question"] for s in self.samples]
-        all_texts = list(set(self.negative_pool + anchors))
-        anchor_embs = self.embed_texts(anchors, model, tokenizer, device)
-        all_embs = self.embed_texts(all_texts, model, tokenizer, device)
-
-        sim_matrix = torch.matmul(anchor_embs, all_embs.T)
-        for i, s in enumerate(self.samples):
-            sorted_indices = torch.argsort(sim_matrix[i], descending=True)
-            for j in sorted_indices:
-                candidate = all_texts[j]
-                if candidate != s["positive"] and candidate != s["question"]:
-                    sim_score = sim_matrix[i][j].item()
-                    if sim_score > 0.7:
-                        s["hard_positive"] = candidate
-                        break
+        print(
+            f"Hard negatives - Mean similarity: {sim_matrix[torch.arange(len(self.samples)), torch.tensor(hard_neg_indices)].mean():.4f}")
+        print(f"Positive similarities - Mean: {pos_sims.mean():.4f}")
+        print(f"Margins - Mean: {margins.mean():.4f}, Std: {margins.std():.4f}")

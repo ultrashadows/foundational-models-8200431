@@ -4,10 +4,11 @@ import json
 import os
 import re
 import pickle
-import ijson
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, ProcessPoolExecutor
 from typing import Dict, List, Optional, Tuple
 from threading import Lock
+
+import ijson
 from torch.utils.data import Dataset
 import torch
 from transformers import AutoTokenizer
@@ -22,7 +23,7 @@ class CacheProcessor(Dataset):
                  seed=42, json_path="dataset.json", pool_path="pool.json", chunk_overlap=50,
                  use_chunking_threshold=400, max_chunks_per_sample=2, min_chunk_tokens=100,
                  preserve_structure=True, cache_dir="cache", enable_cache=True, num_workers=4, batch_size=100):
-        logger.info(f"Initializing Enhanced HybridDatasetProcessor with split='{split}', max_samples={max_samples}")
+        print(f"Initializing Enhanced HybridDatasetProcessor with split='{split}', max_samples={max_samples}")
         self.tokenizer = AutoTokenizer.from_pretrained("./models/albertina-1b5") if tokenizer is None else tokenizer
         self.max_length = max_length
         self.chunk_overlap = chunk_overlap
@@ -58,7 +59,8 @@ class CacheProcessor(Dataset):
             index = 1
             for obj in ijson.items(f, 'item'):
                 doc_id = self._extract_id(obj['_id'])
-                print(index)
+                if index % 10000 == 0:
+                    print(f"Loaded {index} documents into pool")
                 index += 1
                 self.pool_doc_map[doc_id] = obj
 
@@ -66,42 +68,14 @@ class CacheProcessor(Dataset):
 
         if self.enable_cache:
             os.makedirs(self.cache_dir, exist_ok=True)
+            self.cached_keys = set()
+            if os.path.exists(self.cache_dir):
+                cache_files = [f[:-4] for f in os.listdir(self.cache_dir) if f.endswith(".pkl")]
+                self.cached_keys.update(cache_files)
+            print(f"Found {len(self.cached_keys)} existing cache files")
 
         self.samples = self._process_dataset(json_path, split, train_ratio, max_samples, seed)
-        logger.info(f"Dataset ready with {len(self.samples)} samples")
-
-    def _load_pool_data_optimized(self):
-        cache_file = f"{self.pool_path}.cache.pkl"
-
-        if (os.path.exists(cache_file) and
-                os.path.getmtime(cache_file) > os.path.getmtime(self.pool_path)):
-            logger.info("Loading from cache...")
-            with open(cache_file, 'rb') as f:
-                self.pool_doc_map = pickle.load(f)
-            logger.info(f"Loaded {len(self.pool_doc_map)} documents from cache")
-            return
-
-        logger.info("Parsing JSON file...")
-        self.pool_doc_map = {}
-
-        with open(self.pool_path, 'r', encoding='utf-8') as f:
-            for line_num, line in enumerate(f, 1):
-                if line.strip():
-                    try:
-                        obj = json.loads(line)
-                        doc_id = self._extract_id(obj['_id'])
-                        self.pool_doc_map[doc_id] = obj
-                    except json.JSONDecodeError:
-                        continue
-
-                if line_num % 50000 == 0:
-                    logger.info(f"Processed {line_num} documents...")
-
-        logger.info("Caching results...")
-        with open(cache_file, 'wb') as f:
-            pickle.dump(self.pool_doc_map, f, protocol=pickle.HIGHEST_PROTOCOL)
-
-        logger.info(f"Loaded {len(self.pool_doc_map)} documents")
+        print(f"Dataset ready with {len(self.samples)} samples")
 
     @classmethod
     def preprocess_only(cls, json_path: str, pool_path: str, cache_dir: str = "cache", max_length: int = 512,
@@ -110,7 +84,7 @@ class CacheProcessor(Dataset):
                         preserve_structure: bool = True, force_refresh: bool = False,
                         num_workers: int = 4, batch_size: int = 100):
 
-        logger.info(f"Starting preprocessing-only mode with {num_workers} workers")
+        print(f"Starting preprocessing-only mode with {num_workers} workers")
 
         processor = cls(
             tokenizer=AutoTokenizer.from_pretrained("./models/albertina-1b5"),
@@ -134,12 +108,12 @@ class CacheProcessor(Dataset):
 
         if force_refresh:
             processor.clear_cache()
-            logger.info("Cache cleared, starting fresh preprocessing")
+            print("Cache cleared, starting fresh preprocessing")
 
         processor._preprocess_all_documents()
 
         stats = processor.get_cache_stats()
-        logger.info(f"Preprocessing completed. Cache stats: {stats}")
+        print(f"Preprocessing completed. Cache stats: {stats}")
 
         return processor
 
@@ -158,15 +132,11 @@ class CacheProcessor(Dataset):
             for doc, wrong_doc in doc_batch:
                 try:
                     doc_id = self._extract_id(doc['_id'])
-
                     cache_key = self._get_cache_key(doc_id)
 
-                    with self.cache_lock:
-                        cached_result = self._load_from_cache(cache_key)
-
-                    if cached_result is not None:
+                    if cache_key in self.cached_keys:
                         local_stats['cache_hits'] += 1
-                        results.append(cached_result)
+                        results.append({'cached': True, 'doc_id': doc_id})
                     else:
                         processed_result = self._process_document_without_cache(doc, wrong_doc)
                         if processed_result is not None:
@@ -180,7 +150,7 @@ class CacheProcessor(Dataset):
                     local_stats['processed'] += 1
 
                 except Exception as e:
-                    logger.error(f"Error processing document {doc.get('_id', 'unknown')}: {e}")
+                    print(f"Error processing document {doc.get('_id', 'unknown')}: {e}")
                     local_stats['errors'] += 1
                     results.append(None)
 
@@ -203,13 +173,14 @@ class CacheProcessor(Dataset):
         correct_metadata = self._extract_document_metadata(doc)
         wrong_metadata = self._extract_document_metadata(wrong_doc)
 
-        should_chunk_positive = self._should_chunk(correct_doc_text)
-        should_chunk_negative = self._should_chunk(wrong_doc_text)
+        should_chunk_positive = self._should_chunk_fast(correct_doc_text)
+        should_chunk_negative = self._should_chunk_fast(wrong_doc_text)
 
         if should_chunk_positive or should_chunk_negative:
-            correct_chunks = self._tokenize_and_chunk(correct_doc_text,
-                                                      correct_metadata) if should_chunk_positive else [correct_doc_text]
-            wrong_chunks = self._tokenize_and_chunk(wrong_doc_text, wrong_metadata) if should_chunk_negative else [
+            correct_chunks = self._tokenize_and_chunk_fast(correct_doc_text,
+                                                           correct_metadata) if should_chunk_positive else [
+                correct_doc_text]
+            wrong_chunks = self._tokenize_and_chunk_fast(wrong_doc_text, wrong_metadata) if should_chunk_negative else [
                 wrong_doc_text]
 
             result = {
@@ -230,12 +201,39 @@ class CacheProcessor(Dataset):
 
         return result
 
+    def _should_chunk_fast(self, text: str) -> bool:
+        tokens = self.tokenizer.tokenize(text)
+        return len(tokens) > self.use_chunking_threshold
+
+    def _tokenize_and_chunk_fast(self, text: str, metadata: str = "") -> List[str]:
+        tokens = self.tokenizer.tokenize(text)
+
+        if len(tokens) <= self.effective_doc_length:
+            return [text]
+
+        chunks = []
+        stride = 32
+        start = 0
+
+        while start < len(tokens):
+            end = min(start + self.effective_doc_length, len(tokens))
+            chunk_tokens = tokens[start:end]
+
+            if len(chunk_tokens) >= self.min_chunk_tokens:
+                chunk_text = self.tokenizer.convert_tokens_to_string(chunk_tokens)
+                if metadata and start == 0:
+                    chunk_text = f"{metadata}\n\n{chunk_text}"
+                chunks.append(chunk_text)
+
+            if end >= len(tokens):
+                break
+
+            start += stride
+
+        return chunks if chunks else [text]
+
     def _create_document_batches(self, doc_pairs: List[Tuple[Dict, Dict]]) -> List[List[Tuple[Dict, Dict]]]:
-        batches = []
-        for i in range(0, len(doc_pairs), self.batch_size):
-            batch = doc_pairs[i:i + self.batch_size]
-            batches.append(batch)
-        return batches
+        return [doc_pairs[i:i + self.batch_size] for i in range(0, len(doc_pairs), self.batch_size)]
 
     def _preprocess_all_documents(self):
         logger.info(f"Starting complete document preprocessing with {self.num_workers} workers")
@@ -244,23 +242,42 @@ class CacheProcessor(Dataset):
             data = json.load(f)
 
         doc_pairs = []
-        for doc in data:
-            if 'results' in doc and isinstance(doc['results'], list) and doc.get('wrong'):
-                wrong_id = doc['wrong']['$oid']
-                wrong_doc = self.pool_doc_map.get(wrong_id)
-                if wrong_doc:
-                    doc_pairs.append((doc, wrong_doc))
+        existing_cache_count = 0
 
-        total_docs = len(doc_pairs)
-        logger.info(f"Found {total_docs} document pairs to process")
+        for doc in data:
+            if 'results' not in doc or not isinstance(doc['results'], list):
+                continue
+            if 'wrong' not in doc or not isinstance(doc['wrong'], dict):
+                continue
+
+            doc_id = self._extract_id(doc['_id'])
+            if self.enable_cache and doc_id in self.cached_keys:
+                existing_cache_count += 1
+                continue
+
+            wrong_id = doc['wrong'].get('$oid')
+            if not wrong_id:
+                continue
+
+            wrong_doc = self.pool_doc_map.get(wrong_id)
+            if not wrong_doc:
+                continue
+
+            doc_pairs.append((doc, wrong_doc))
+
+        logger.info(f"Found {existing_cache_count} existing cache files")
+        logger.info(f"Document pairs to process: {len(doc_pairs)}")
+
+        if not doc_pairs:
+            logger.info("All documents already cached")
+            return
 
         batches = self._create_document_batches(doc_pairs)
-        logger.info(f"Created {len(batches)} batches with batch size {self.batch_size}")
 
         with self.progress_lock:
-            self.progress_stats = {'processed': 0, 'cache_hits': 0, 'new_processed': 0, 'errors': 0}
+            self.progress_stats = {'processed': 0, 'cache_hits': existing_cache_count, 'new_processed': 0, 'errors': 0}
 
-        with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+        with ProcessPoolExecutor(max_workers=self.num_workers) as executor:
             future_to_batch = {
                 executor.submit(self._process_document_batch, batch): i
                 for i, batch in enumerate(batches)
@@ -274,31 +291,37 @@ class CacheProcessor(Dataset):
                             current_stats = self.progress_stats.copy()
 
                         logger.info(f"Processed {batch_idx + 1}/{len(batches)} batches "
-                                    f"(Docs: {current_stats['processed']}/{total_docs}, "
+                                    f"(Docs: {current_stats['processed']}, "
                                     f"Cache hits: {current_stats['cache_hits']}, "
                                     f"New: {current_stats['new_processed']}, "
                                     f"Errors: {current_stats['errors']})")
-
                 except Exception as e:
                     logger.error(f"Error processing batch {batch_idx}: {e}")
 
-        with self.progress_lock:
-            final_stats = self.progress_stats.copy()
-
-        logger.info(f"Preprocessing complete: {final_stats['processed']} documents processed, "
-                    f"{final_stats['cache_hits']} cache hits, {final_stats['new_processed']} newly processed, "
-                    f"{final_stats['errors']} errors")
-
     def _process_dataset_parallel(self, data: List[Dict]) -> List[Dict[str, str]]:
-        logger.info(f"Processing dataset with {self.num_workers} workers...")
+        print(f"Processing dataset with {self.num_workers} workers...")
 
         doc_pairs = []
         for doc in data:
-            if 'results' in doc and isinstance(doc['results'], list) and doc.get('wrong'):
-                wrong_id = doc['wrong']['$oid']
-                wrong_doc = self.pool_doc_map.get(wrong_id)
-                if wrong_doc:
-                    doc_pairs.append((doc, wrong_doc))
+            if 'results' not in doc or not isinstance(doc['results'], list):
+                continue
+            if 'wrong' not in doc or not isinstance(doc['wrong'], dict):
+                continue
+
+            doc_id = self._extract_id(doc['_id'])
+            if self.enable_cache and doc_id in self.cached_keys:
+                self.progress_stats['cache_hits'] += 1
+                continue
+
+            wrong_id = doc['wrong'].get('$oid')
+            if not wrong_id:
+                continue
+
+            wrong_doc = self.pool_doc_map.get(wrong_id)
+            if not wrong_doc:
+                continue
+
+            doc_pairs.append((doc, wrong_doc))
 
         batches = self._create_document_batches(doc_pairs)
         all_samples = []
@@ -314,7 +337,7 @@ class CacheProcessor(Dataset):
                     batch_samples = future.result()
                     all_samples.extend(batch_samples)
                 except Exception as e:
-                    logger.error(f"Error processing sample batch: {e}")
+                    print(f"Error processing sample batch: {e}")
 
         return all_samples
 
@@ -328,11 +351,9 @@ class CacheProcessor(Dataset):
         try:
             for doc, wrong_doc in doc_batch:
                 doc_id = self._extract_id(doc['_id'])
-
                 cache_key = self._get_cache_key(doc_id)
 
-                with self.cache_lock:
-                    cached_result = self._load_from_cache(cache_key)
+                cached_result = self._load_from_cache(cache_key)
 
                 if cached_result is None:
                     cached_result = self._process_document_without_cache(doc, wrong_doc)
@@ -394,33 +415,28 @@ class CacheProcessor(Dataset):
         return os.path.join(self.cache_dir, f"{cache_key}.pkl")
 
     def _load_from_cache(self, cache_key: str) -> Optional[Dict]:
-        if not self.enable_cache:
+        if not self.enable_cache or cache_key not in self.cached_keys:
             return None
-
-        cache_path = self._get_cache_path(cache_key)
-        if os.path.exists(cache_path):
-            try:
-                with open(cache_path, 'rb') as f:
-                    return pickle.load(f)
-            except Exception as e:
-                logger.warning(f"Failed to load cache {cache_key}: {e}")
-                return None
-        return None
+        try:
+            with open(self._get_cache_path(cache_key), 'rb') as f:
+                return pickle.load(f)
+        except Exception as e:
+            print(f"Failed to load cache {cache_key}: {e}")
+            return None
 
     def _save_to_cache(self, cache_key: str, data: Dict) -> None:
         if not self.enable_cache:
             return
 
         cache_path = self._get_cache_path(cache_key)
+        tmp_path = cache_path + ".tmp"
         try:
-            with open(cache_path, 'wb') as f:
-                pickle.dump(data, f)
+            with open(tmp_path, 'wb') as f:
+                pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(tmp_path, cache_path)
+            self.cached_keys.add(cache_key)
         except Exception as e:
-            logger.warning(f"Failed to save cache {cache_key}: {e}")
-
-    def _should_chunk(self, text: str) -> bool:
-        token_count = len(self.tokenizer.tokenize(text))
-        return token_count > self.use_chunking_threshold
+            print(f"Failed to save cache {cache_key}: {e}")
 
     def _extract_document_metadata(self, doc: Dict) -> str:
         metadata_parts = []
@@ -435,122 +451,6 @@ class CacheProcessor(Dataset):
             metadata_parts.append(f"Data: {doc['data']}")
 
         return " | ".join(metadata_parts) if metadata_parts else ""
-
-    def _find_structural_boundaries(self, text: str) -> List[int]:
-        boundaries = [0]
-
-        for pattern_name, pattern in self.legal_patterns.items():
-            matches = pattern.finditer(text)
-            for match in matches:
-                boundaries.append(match.start())
-
-        sentence_pattern = re.compile(r'[.!?]\s+')
-        matches = sentence_pattern.finditer(text)
-        for match in matches:
-            boundaries.append(match.end())
-
-        return sorted(list(set(boundaries)))
-
-    def _tokenize_and_chunk(self, text: str, metadata: str = "") -> List[str]:
-        tokens = self.tokenizer.tokenize(text)
-
-        if len(tokens) <= self.effective_doc_length:
-            return [text]
-
-        chunks = []
-
-        if self.preserve_structure:
-            boundaries = self._find_structural_boundaries(text)
-            chunks = self._chunk_by_structure(text, tokens, boundaries, metadata)
-        else:
-            chunks = self._chunk_by_tokens(text, tokens, metadata)
-
-        return chunks if chunks else [text]
-
-    def _chunk_by_structure(self, text: str, tokens: List[str], boundaries: List[int], metadata: str) -> List[str]:
-        chunks = []
-        current_token_start = 0
-
-        for boundary in boundaries[1:] + [len(text)]:
-            char_to_token = self._map_chars_to_tokens(text, tokens)
-            boundary_token = char_to_token.get(boundary, len(tokens))
-
-            chunk_tokens = tokens[current_token_start:boundary_token]
-
-            if len(chunk_tokens) >= self.min_chunk_tokens:
-                if len(chunk_tokens) > self.effective_doc_length:
-                    sub_chunks = self._split_large_chunk(chunk_tokens, metadata)
-                    chunks.extend(sub_chunks)
-                else:
-                    chunk_text = self.tokenizer.convert_tokens_to_string(chunk_tokens)
-                    if metadata:
-                        chunk_text = f"{metadata}\n\n{chunk_text}"
-                    chunks.append(chunk_text)
-
-                current_token_start = max(0, boundary_token - self.chunk_overlap)
-
-            if boundary_token >= len(tokens):
-                break
-
-        return chunks
-
-    def _chunk_by_tokens(self, text: str, tokens: List[str], metadata: str) -> List[str]:
-        chunks = []
-        start = 0
-
-        while start < len(tokens):
-            end = min(start + self.effective_doc_length, len(tokens))
-            chunk_tokens = tokens[start:end]
-
-            if len(chunk_tokens) >= self.min_chunk_tokens:
-                chunk_text = self.tokenizer.convert_tokens_to_string(chunk_tokens)
-                if metadata:
-                    chunk_text = f"{metadata}\n\n{chunk_text}"
-                chunks.append(chunk_text)
-
-            start = end - self.chunk_overlap
-
-            if end >= len(tokens):
-                break
-
-        return chunks
-
-    def _split_large_chunk(self, chunk_tokens: List[str], metadata: str) -> List[str]:
-        sub_chunks = []
-        start = 0
-
-        while start < len(chunk_tokens):
-            end = min(start + self.effective_doc_length, len(chunk_tokens))
-            sub_chunk_tokens = chunk_tokens[start:end]
-
-            if len(sub_chunk_tokens) >= self.min_chunk_tokens:
-                sub_chunk_text = self.tokenizer.convert_tokens_to_string(sub_chunk_tokens)
-                if metadata:
-                    sub_chunk_text = f"{metadata}\n\n{sub_chunk_text}"
-                sub_chunks.append(sub_chunk_text)
-
-            start = end - self.chunk_overlap
-
-            if end >= len(chunk_tokens):
-                break
-
-        return sub_chunks
-
-    def _map_chars_to_tokens(self, text: str, tokens: List[str]) -> Dict[int, int]:
-        char_to_token = {}
-        current_pos = 0
-
-        for i, token in enumerate(tokens):
-            token_text = token.replace('▁', ' ').replace('##', '')
-
-            while current_pos < len(text) and text[current_pos:current_pos + len(token_text)] != token_text:
-                current_pos += 1
-
-            if current_pos < len(text):
-                char_to_token[current_pos] = i
-                current_pos += len(token_text)
-
-        return char_to_token
 
     def _find_relevant_chunks(self, question: str, chunks: List[str], max_chunks: int = None) -> List[str]:
         if max_chunks is None:
@@ -621,12 +521,10 @@ class CacheProcessor(Dataset):
 
     def _process_document_with_cache(self, doc: Dict, wrong_doc: Dict) -> Optional[Dict]:
         doc_id = self._extract_id(doc['_id'])
-
         cache_key = self._get_cache_key(doc_id)
-        cached_result = self._load_from_cache(cache_key)
 
-        if cached_result is not None:
-            return cached_result
+        if cache_key in self.cached_keys:
+            return self._load_from_cache(cache_key)
 
         cached_result = self._process_document_without_cache(doc, wrong_doc)
         if cached_result is not None:
@@ -646,14 +544,14 @@ class CacheProcessor(Dataset):
 
         all_samples = self._process_dataset_parallel(data)
 
-        logger.info(f"Total samples before split/filtering: {len(all_samples)}")
+        print(f"Total samples before split/filtering: {len(all_samples)}")
 
         random.seed(seed)
         random.shuffle(all_samples)
 
         if max_samples is not None and len(all_samples) > max_samples:
             all_samples = all_samples[:max_samples]
-            logger.info(f"Trimmed to max_samples={max_samples}")
+            print(f"Trimmed to max_samples={max_samples}")
 
         train_size = int(len(all_samples) * train_ratio)
 
@@ -664,7 +562,7 @@ class CacheProcessor(Dataset):
         else:
             samples = all_samples
 
-        logger.info(f"Created '{split}' dataset with {len(samples)} samples.")
+        print(f"Created '{split}' dataset with {len(samples)} samples.")
         return samples
 
     def clear_cache(self):
@@ -672,7 +570,8 @@ class CacheProcessor(Dataset):
             import shutil
             shutil.rmtree(self.cache_dir)
             os.makedirs(self.cache_dir, exist_ok=True)
-            logger.info("Cache cleared")
+            self.cached_keys.clear()
+            print("Cache cleared")
 
     def get_cache_stats(self) -> Dict:
         if not self.enable_cache or not os.path.exists(self.cache_dir):
@@ -739,11 +638,11 @@ class CacheProcessor(Dataset):
 
     def set_num_workers(self, num_workers: int):
         self.num_workers = max(1, num_workers)
-        logger.info(f"Updated number of workers to {self.num_workers}")
+        print(f"Updated number of workers to {self.num_workers}")
 
     def set_batch_size(self, batch_size: int):
         self.batch_size = max(1, batch_size)
-        logger.info(f"Updated batch size to {self.batch_size}")
+        print(f"Updated batch size to {self.batch_size}")
 
 
 if __name__ == "__main__":

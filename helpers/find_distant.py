@@ -11,8 +11,8 @@ def normalize(vectors):
 if __name__ == '__main__':
     client = MongoClient("mongodb://localhost:27017/")
     db = client["database"]
-    encoder_col = db["encoder"]
-    pool_col = db["pool"]
+    encoder_col = db["test"]
+    pool_col = db["test"]
 
     encoder_docs = list(encoder_col.find({"embedding": {"$exists": True}}, {"_id": 1, "embedding": 1}))
 

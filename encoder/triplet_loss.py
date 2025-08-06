@@ -35,6 +35,7 @@ class TripletLoss(nn.Module):
 
         if self.mining_strategy == 'adaptive':
             margin = self.margin * (1.0 + torch.exp(-self.margin_scale * (pos_sim - neg_sim)))
+            margin = margin.clamp(min=0.05, max=2.0)
         else:
             margin = self.margin
 
