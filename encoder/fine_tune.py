@@ -148,7 +148,7 @@ def calibrate_margins_for_dataset_rank0_only(rank, world_size, model, train_data
     return float(margins[0].item()), float(margins[1].item())
 
 
-def train_distributed(rank, world_size, num_epochs=10, start_index=1, num_datasets=5):
+def train_distributed(rank, world_size, num_epochs=10, start_index=6, num_datasets=10):
     dist.init_process_group(backend='nccl')
     torch.cuda.set_device(rank)
     device = torch.device(f'cuda:{rank}')
@@ -278,8 +278,10 @@ def run_training_loop(rank, world_size, model, train_loader, train_sampler,
 
     for epoch in range(num_epochs):
         model.train()
-        running_loss = 0.0
-        batch_losses = []
+        running_total = 0.0
+        running_hinge = 0.0
+        running_reg = 0.0
+        batch_totals, batch_hinges, batch_regs = [], [], []
         num_batches = 0
         epoch_start_time = time.time()
 
@@ -305,8 +307,9 @@ def run_training_loop(rank, world_size, model, train_loader, train_sampler,
                     anchor = model(anchor_inputs['input_ids'], anchor_inputs['attention_mask'])
                     positive = model(positive_inputs['input_ids'], positive_inputs['attention_mask'])
                     negative = model(negative_inputs['input_ids'], negative_inputs['attention_mask'])
-                    loss = criterion(anchor, positive, negative, weights)
-                    loss = loss / accumulation_steps
+
+                    total_loss, hinge_det, reg_det = criterion(anchor, positive, negative, weights)
+                    loss = total_loss / accumulation_steps
 
                 if world_size > 1 and not should_sync:
                     with model.no_sync():
@@ -324,17 +327,30 @@ def run_training_loop(rank, world_size, model, train_loader, train_sampler,
                         logger.warning(f"[RANK {rank}] Skipping step due to unstable grad norm: {grad_norm:.4f}")
                         optimizer.zero_grad()
 
-                batch_loss = loss.item() * accumulation_steps
-                running_loss += batch_loss
-                batch_losses.append(batch_loss)
+                batch_total = total_loss.item()
+                batch_hinge = hinge_det.item()
+                batch_reg = reg_det.item()
+
+                running_total += batch_total
+                running_hinge += batch_hinge
+                running_reg += batch_reg
+
+                batch_totals.append(batch_total)
+                batch_hinges.append(batch_hinge)
+                batch_regs.append(batch_reg)
+
                 num_batches += 1
 
                 if is_main_process and isinstance(progress_bar, tqdm):
                     lrs = scheduler.get_last_lr()
                     current_lr = lrs[0] if len(lrs) > 0 else optimizer.param_groups[0]["lr"]
-                    recent_loss = sum(batch_losses[-10:]) / min(10, len(batch_losses))
+                    recent_total = sum(batch_totals[-10:]) / min(10, len(batch_totals))
+                    recent_hinge = sum(batch_hinges[-10:]) / min(10, len(batch_hinges))
+                    recent_reg = sum(batch_regs[-10:]) / min(10, len(batch_regs))
                     progress_bar.set_description(
-                        f"Epoch {epoch + 1}/{num_epochs}, Loss: {recent_loss:.4f}, LR: {current_lr:.2e}, Margin: {current_margin:.3f}"
+                        f"Epoch {epoch + 1}/{num_epochs}, "
+                        f"Loss: {recent_total:.4f}, Hinge: {recent_hinge:.4f}, Reg: {recent_reg:.4f}, "
+                        f"LR: {current_lr:.2e}, Margin: {current_margin:.3f}"
                     )
 
             except Exception as e:
@@ -342,7 +358,9 @@ def run_training_loop(rank, world_size, model, train_loader, train_sampler,
                 optimizer.zero_grad()
                 continue
 
-        avg_train_loss = running_loss / max(1, num_batches)
+        avg_total = running_total / max(1, num_batches)
+        avg_hinge = running_hinge / max(1, num_batches)
+        avg_reg = running_reg / max(1, num_batches)
 
         probe_pos, probe_neg = None, None
         try:
@@ -353,7 +371,9 @@ def run_training_loop(rank, world_size, model, train_loader, train_sampler,
 
         if writer:
             lrs = scheduler.get_last_lr()
-            writer.add_scalar("Loss/Train", avg_train_loss, epoch)
+            writer.add_scalar("Loss/Train_total", avg_total, epoch)
+            writer.add_scalar("Loss/Hinge_only", avg_hinge, epoch)
+            writer.add_scalar("Loss/Regularizer_only", avg_reg, epoch)
             writer.add_scalar("Learning_Rate", lrs[0] if len(lrs) > 0 else optimizer.param_groups[0]["lr"], epoch)
             writer.add_scalar("Time/Epoch", time.time() - epoch_start_time, epoch)
             writer.add_scalar("Margin", current_margin, epoch)

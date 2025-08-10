@@ -27,7 +27,7 @@ class TripletLoss(nn.Module):
         self.eps = eps
 
     def set_margin(self, margin: float):
-        self.margin = margin
+        self.margin = max(0.05, min(float(margin), 2.0))
 
     def set_regularization(
         self,
@@ -52,14 +52,14 @@ class TripletLoss(nn.Module):
         return max(eff, self.min_reg_weight)
 
     def forward(self, anchor, positive, negative, weights=None):
-        anchor = F.normalize(anchor, p=2, dim=-1)
-        positive = F.normalize(positive, p=2, dim=-1)
-        negative = F.normalize(negative, p=2, dim=-1)
+        anchor = F.normalize(anchor, p=2, dim=-1, eps=self.eps)
+        positive = F.normalize(positive, p=2, dim=-1, eps=self.eps)
+        negative = F.normalize(negative, p=2, dim=-1, eps=self.eps)
 
         pos_sim = torch.sum(anchor * positive, dim=-1)
         neg_sim = torch.sum(anchor * negative, dim=-1)
 
-        margin_term = self.margin_scale * (self.margin + pos_sim - neg_sim)
+        margin_term = self.margin_scale * (self.margin + neg_sim - pos_sim)
         triplet_losses = torch.clamp(margin_term, min=0.0)
 
         if weights is not None:
@@ -70,11 +70,13 @@ class TripletLoss(nn.Module):
         reg_w = self._effective_reg_weight()
         if reg_w > 0.0:
             reg_term = torch.exp(-triplet_loss / (self.margin + self.eps))
-            loss = triplet_loss + reg_w * reg_term
+            reg_loss = reg_w * reg_term
+            total_loss = triplet_loss + reg_loss
         else:
-            loss = triplet_loss
+            reg_loss = torch.tensor(0.0, device=triplet_loss.device, dtype=triplet_loss.dtype)
+            total_loss = triplet_loss
 
-        return loss
+        return total_loss, triplet_loss.detach(), reg_loss.detach()
 
     def forward_info_nce(self, anchor, positive):
         anchor = F.normalize(anchor, dim=1, eps=self.eps)
@@ -119,6 +121,3 @@ class TripletLoss(nn.Module):
         pos_d = torch.stack(hardest_positive_dist)
         neg_d = torch.stack(hardest_negative_dist)
         return pos_d, neg_d
-
-    def set_margin(self, new_margin):
-        self.margin = max(0.05, min(new_margin, 2.0))
