@@ -1,86 +1,42 @@
 import numpy as np
-from pymongo import MongoClient, UpdateOne
+from pymongo import MongoClient, UpdateOne, WriteConcern
 from tqdm import tqdm
+from sentence_transformers import SentenceTransformer
 
 
-def normalize(vectors):
-    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
-    return vectors / norms
+def ensure_embeddings(col, text_field="Texto Integral", batch_fetch=20000, encode_bs=256):
+    model = SentenceTransformer("paraphrase-multilingual-mpnet-base-v2")
+    query = {"embedding": {"$exists": False}, text_field: {"$exists": True}}
+    total = col.count_documents(query)
+    if total == 0:
+        print("✅ All documents already have embeddings.")
+        return
+    cursor = col.find(query, {"_id": 1, text_field: 1}).batch_size(batch_fetch)
+    ids, texts, ops = [], [], []
+    pbar = tqdm(total=total, desc="Generating embeddings", unit="doc")
+    for doc in cursor:
+        ids.append(doc["_id"])
+        texts.append(doc[text_field])
+        if len(texts) >= encode_bs:
+            embs = model.encode(texts, batch_size=encode_bs, convert_to_numpy=True, show_progress_bar=False)
+            for _id, emb in zip(ids, embs):
+                ops.append(UpdateOne({"_id": _id}, {"$set": {"embedding": emb.astype(np.float32).tolist()}}))
+            if ops:
+                col.with_options(write_concern=WriteConcern(w=0, j=False)).bulk_write(ops, ordered=False)
+            pbar.update(len(ids))
+            ids, texts, ops = [], [], []
+    if texts:
+        embs = model.encode(texts, batch_size=encode_bs, convert_to_numpy=True, show_progress_bar=False)
+        for _id, emb in zip(ids, embs):
+            ops.append(UpdateOne({"_id": _id}, {"$set": {"embedding": emb.astype(np.float32).tolist()}}))
+        if ops:
+            col.with_options(write_concern=WriteConcern(w=0, j=False)).bulk_write(ops, ordered=False)
+        pbar.update(len(ids))
+    pbar.close()
 
 
 if __name__ == '__main__':
     client = MongoClient("mongodb://localhost:27017/")
     db = client["database"]
-    encoder_col = db["test"]
-    pool_col = db["test"]
-
-    encoder_docs = list(encoder_col.find({"embedding": {"$exists": True}}, {"_id": 1, "embedding": 1}))
-
-    print("Loading pool documents...")
-    pool_docs = list(pool_col.find({"embedding": {"$exists": True}}, {"_id": 1, "embedding": 1}))
-
-    if not encoder_docs or not pool_docs:
-        print("❌ Missing embeddings in 'encoder' or 'pool'.")
-        exit(1)
-
-    print(f"🔍 {len(encoder_docs)} encoder docs | 🎯 {len(pool_docs)} pool docs")
-
-    pool_ids = [doc["_id"] for doc in pool_docs]
-    pool_embeddings = np.array([doc["embedding"] for doc in pool_docs], dtype=np.float32)
-    pool_embeddings = normalize(pool_embeddings)
-
-    used_wrong_ids = set()
-    id_to_index = {doc_id: idx for idx, doc_id in enumerate(pool_ids)}
-
-    batch_size = 256
-    batch_updates = []
-
-    print("Processing encoder documents...")
-    for i in tqdm(range(0, len(encoder_docs), batch_size), desc="Processing batches"):
-        batch_docs = encoder_docs[i:i + batch_size]
-
-        batch_embeddings = np.array([doc["embedding"] for doc in batch_docs], dtype=np.float32)
-        batch_embeddings = normalize(batch_embeddings)
-
-        similarities = batch_embeddings @ pool_embeddings.T
-
-        for j, doc in enumerate(batch_docs):
-            sim_row = similarities[j]
-            global_index = i + j
-
-            candidate_indices = np.where((sim_row >= -0.3) & (sim_row <= 0.2))[0]
-            candidate_indices = [idx for idx in candidate_indices if pool_ids[idx] not in used_wrong_ids]
-
-            if candidate_indices:
-                selected_idx = np.random.choice(candidate_indices)
-                wrong_id = pool_ids[selected_idx]
-                used_wrong_ids.add(wrong_id)
-            else:
-                sorted_indices = np.argsort(sim_row)
-                fallback_idx = None
-
-                for idx in sorted_indices:
-                    if pool_ids[idx] not in used_wrong_ids:
-                        fallback_idx = idx
-                        break
-
-                if fallback_idx is not None:
-                    fallback_sim = sim_row[fallback_idx]
-                    wrong_id = pool_ids[fallback_idx]
-                    used_wrong_ids.add(wrong_id)
-                    print(f"⚠️ Fallback at index {global_index}: no available candidates in [-0.3, 0.2]. "
-                          f"Using most dissimilar (sim={fallback_sim:.3f}) → {wrong_id}")
-                else:
-                    print(f"❌ No available unused 'wrong' documents for encoder index {global_index}. Skipping.")
-                    continue
-
-            batch_updates.append(
-                UpdateOne({"_id": doc["_id"]}, {"$set": {"wrong": wrong_id}})
-            )
-
-        if len(batch_updates) >= 5000 or i + batch_size >= len(encoder_docs):
-            if batch_updates:
-                encoder_col.bulk_write(batch_updates)
-                batch_updates = []
-
-    print("✅ All encoder docs updated with unique cosine-distant 'wrong' examples.")
+    col = db["encoder"]
+    ensure_embeddings(col)
