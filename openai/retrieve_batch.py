@@ -7,7 +7,7 @@ from bson import ObjectId
 from dotenv import load_dotenv
 from pymongo import MongoClient
 
-from embed.helpers import embed
+from helpers import embed
 
 load_dotenv()
 client = MongoClient("mongodb://localhost:27017/")

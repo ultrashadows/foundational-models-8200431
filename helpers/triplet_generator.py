@@ -1,22 +1,23 @@
 import json
 import os
 import pickle
-import hashlib
 import argparse
 import random
 import time
 import numpy as np
 from collections import defaultdict
 from tqdm import tqdm
-from typing import List, Dict, Tuple, Optional, Iterator
+from typing import List, Dict, Tuple, Optional
 import torch
 from sentence_transformers import SentenceTransformer, util
 import gc
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 import threading
 import psutil
 import sys
+from transformers import AutoTokenizer
+import ijson
 
 
 class ColoredFormatter(logging.Formatter):
@@ -73,35 +74,42 @@ logger = setup_logging()
 DATASET_PATH = "../encoder/dataset.json"
 CACHE_DIR = "../encoder/cache"
 DATASETS_DIR = "../encoder/datasets"
-POOL_DIR = "../encoder/pool"
-POOL_SHARDS = os.path.join(POOL_DIR, "shards")
+POOL_PATH = "../encoder/pool.json"
+POOL_CACHE_DIR = "../encoder/pool_cache"
+TRIPLET_CHECKPOINT_DIR = "../encoder/triplet_checkpoints"
 
 BATCH_SIZE = 64
 QUERY_BATCH_SIZE = 64
 EMBEDDING_BATCH_SIZE = 64
-FIRST_BATCH_SIZE = 5000
-NEXT_BATCH_SIZE = 3000
+FIRST_BATCH_SIZE = 125000
+NEXT_BATCH_SIZE = 0
 
-MAX_SHARD_CACHE = 30
 MEMORY_CLEANUP_THRESHOLD = 0.85
 POS_CACHE_MAX_ITEMS = 1000000
 
-MARGIN_START = 0.15
-MARGIN_END = 0.05
-MARGIN_TOL_START = 0.05
-MARGIN_TOL_END = 0.02
+MARGIN_START = 0.25
+MARGIN_END = 0.10
+MARGIN_TOL_START = 0.10
+MARGIN_TOL_END = 0.05
 
-MIN_POS_SIM = 0.2
-MIN_MARGIN = 0.02
-MAX_POS_NEG_SIM = 0.95
-MIN_NEG_SIM = 0.1
-TARGET_TRIPLETS = 10000
-OVERLAP_PERCENT = 0.2
+MIN_POS_SIM = 0.25
+MIN_MARGIN = 0.12
+MAX_POS_NEG_SIM = 0.88
+MIN_NEG_SIM = 0.20
+TARGET_TRIPLETS = 125000
+OVERLAP_PERCENT = 0.0
 
-SHARD_SIZE = 500_000
-NEG_CANDIDATES = 8192
-TOP_K_NEGATIVES = 64
-NUM_WORKERS = 16
+NEG_CANDIDATES = 16384
+TOP_K_NEGATIVES = 128
+NUM_WORKERS = 8
+
+MAX_CHUNK_USAGE = 3
+CHUNK_SIZE = 512
+CHUNK_OVERLAP = 128
+MIN_CHUNK_TOKENS = 150
+CHECKPOINT_EVERY = 5000
+SIMILARITY_BATCH_SIZE = 512
+MAX_POOL_SIZE = 2000000
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32
@@ -149,7 +157,6 @@ def check_memory_usage():
 
 
 def aggressive_cleanup():
-    logger.debug("Running aggressive memory cleanup...")
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -161,37 +168,19 @@ def thread_safe_log(msg: str, level: int = logging.INFO):
         logger.log(level, msg)
 
 
-def sha1(text: str) -> str:
-    return hashlib.sha1(text.encode("utf-8")).hexdigest()
-
-
 def ensure_dirs():
-    dirs = [DATASETS_DIR, POOL_DIR, POOL_SHARDS, CACHE_DIR]
+    dirs = [DATASETS_DIR, CACHE_DIR, POOL_CACHE_DIR, TRIPLET_CHECKPOINT_DIR]
     for d in dirs:
         os.makedirs(d, exist_ok=True)
-    logger.debug(f"Ensured directories: {dirs}")
 
 
-def load_json_chunked(path: str, chunk_size: int = 10000) -> Iterator[List[Dict]]:
-    logger.info(f"📖 Loading dataset from {path}")
-    monitor.start_stage("dataset_loading")
-
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    total_items = len(data)
-    logger.info(f"Dataset contains {total_items:,} documents")
-
-    with tqdm(total=total_items, desc="Loading dataset", unit="docs") as pbar:
-        for i in range(0, total_items, chunk_size):
-            chunk = data[i:i + chunk_size]
-            yield chunk
-            pbar.update(len(chunk))
-            monitor.increment("documents_loaded", len(chunk))
-
-    del data
-    aggressive_cleanup()
-    monitor.end_stage("dataset_loading")
+def load_pkl_safe(path: str, default=None):
+    try:
+        with open(path, "rb") as f:
+            result = pickle.load(f)
+        return result
+    except (FileNotFoundError, EOFError, pickle.UnpicklingError) as e:
+        return default
 
 
 def save_pkl_atomic(obj, path: str):
@@ -200,7 +189,6 @@ def save_pkl_atomic(obj, path: str):
         with open(tmp_path, "wb") as f:
             pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
         os.replace(tmp_path, path)
-        logger.debug(f"Saved {path}")
     except Exception as e:
         logger.error(f"Failed to save {path}: {e}")
         if os.path.exists(tmp_path):
@@ -208,160 +196,280 @@ def save_pkl_atomic(obj, path: str):
         raise
 
 
-def load_pkl_safe(path: str, default=None):
-    try:
-        with open(path, "rb") as f:
-            result = pickle.load(f)
-        logger.debug(f"Loaded {path}")
-        return result
-    except (FileNotFoundError, EOFError, pickle.UnpicklingError) as e:
-        logger.debug(f"Failed to load {path}: {e}")
-        return default
+class PoolChunker:
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+        self.effective_doc_length = CHUNK_SIZE - 20
+
+    def chunk_document(self, text: str) -> List[str]:
+        tokens = self.tokenizer.tokenize(text)
+
+        if len(tokens) <= self.effective_doc_length:
+            return [text]
+
+        chunks = []
+        stride = self.effective_doc_length - CHUNK_OVERLAP
+        start = 0
+
+        while start < len(tokens):
+            end = min(start + self.effective_doc_length, len(tokens))
+            chunk_tokens = tokens[start:end]
+
+            if len(chunk_tokens) >= MIN_CHUNK_TOKENS:
+                chunk_text = self.tokenizer.convert_tokens_to_string(chunk_tokens)
+                chunks.append(chunk_text)
+
+            if end >= len(tokens):
+                break
+
+            start += stride
+
+        return chunks if chunks else [text]
 
 
-class OptimizedShardManager:
-    def __init__(self):
-        self.shard_cache: Dict[int, torch.Tensor] = {}
-        self.access_counts = defaultdict(int)
-        self.cache_hits = 0
-        self.cache_misses = 0
+class NegativePoolManager:
+    def __init__(self, pool_path: str, model: SentenceTransformer, tokenizer):
+        self.pool_path = pool_path
+        self.model = model
+        self.tokenizer = tokenizer
+        self.chunker = PoolChunker(tokenizer)
         self.global_neg_pool = None
         self.global_neg_texts = None
-        self._build_shard_index()
-        self._build_global_negative_pool()
+        self.chunk_usage_counts = None
+        self._load_or_build_pool()
 
-    def _build_shard_index(self):
-        self.shard_paths = {}
-        self.shard_metas = {}
+    def _load_or_build_pool(self):
+        cache_path = os.path.join(POOL_CACHE_DIR, "pool_embeddings.pt")
+        metadata_path = os.path.join(POOL_CACHE_DIR, "pool_metadata.pkl")
 
-        if not os.path.exists(POOL_SHARDS):
-            logger.warning(f"Shard directory not found: {POOL_SHARDS}")
+        pool_index_json = os.path.join(POOL_CACHE_DIR, "pool_index.json")
+        pool_index_pkl = os.path.join(POOL_CACHE_DIR, "pool_index.pkl")
+
+        if os.path.exists(pool_index_json) or os.path.exists(pool_index_pkl):
+            logger.info("Found sharded pool cache, loading from shards...")
+            self._load_from_shards()
             return
 
-        shard_files = [f for f in os.listdir(POOL_SHARDS)
-                       if f.startswith("shard_") and f.endswith(".pt")]
+        if os.path.exists(cache_path) and os.path.exists(metadata_path):
+            logger.info("Found existing pool cache, loading...")
+            try:
+                logger.info(f"Loading embeddings from {cache_path}...")
+                cache = torch.load(cache_path, map_location='cpu', weights_only=True)
 
-        for shard_file in shard_files:
-            shard_id = int(shard_file.split("_")[1].split(".")[0])
-            self.shard_paths[shard_id] = os.path.join(POOL_SHARDS, shard_file)
+                logger.info(f"Loading metadata from {metadata_path}...")
+                metadata = load_pkl_safe(metadata_path, {})
 
-            meta_path = os.path.join(POOL_SHARDS, f"shard_{shard_id}.meta.pkl")
-            meta = load_pkl_safe(meta_path, [])
-            self.shard_metas[shard_id] = meta
+                logger.info("Moving embeddings to device...")
+                self.global_neg_pool = cache['embeddings'].to(DEVICE, dtype=DTYPE)
+                self.global_neg_texts = metadata['texts']
+                self.chunk_usage_counts = [0] * len(self.global_neg_texts)
 
-        logger.info(
-            f"Found {len(self.shard_paths)} shards with {sum(len(m) for m in self.shard_metas.values()):,} total embeddings")
+                logger.info(f"Successfully loaded {self.global_neg_pool.shape[0]:,} cached chunk embeddings")
+                logger.info(f"Pool ready with {len(self.global_neg_texts):,} negative chunks")
+                return
+            except Exception as e:
+                logger.error(f"Failed to load cache: {e}")
+                logger.info("Will rebuild pool from scratch...")
 
-    def _build_global_negative_pool(self):
-        logger.info("Building global negative pool for faster mining...")
-        monitor.start_stage("global_negative_pool")
+        logger.info(f"No cache found. Building pool from {self.pool_path}")
+        logger.info("This will take a while but only needs to be done once...")
+        monitor.start_stage("pool_building")
+
+        if not os.path.exists(self.pool_path):
+            logger.error(f"Pool file not found: {self.pool_path}")
+            self._create_dummy_pool()
+            monitor.end_stage("pool_building")
+            return
+
+        logger.info("Streaming pool.json with ijson (this may take a few minutes for 7GB file)...")
+        all_chunks = []
+        doc_count = 0
+
+        with open(self.pool_path, "rb") as f:
+            parser = ijson.items(f, "item")
+
+            for doc in tqdm(parser, desc="Streaming and chunking pool documents", unit=" docs"):
+                text = doc.get("Texto Integral", "")
+                if text and len(text.strip()) > 50:
+                    chunks = self.chunker.chunk_document(text.strip())
+                    all_chunks.extend(chunks)
+                    doc_count += 1
+
+                if doc_count % 10000 == 0 and check_memory_usage():
+                    logger.info(f"Processed {doc_count:,} docs, created {len(all_chunks):,} chunks so far")
+                    aggressive_cleanup()
+
+        if not all_chunks:
+            logger.error("No valid chunks created from pool!")
+            self._create_dummy_pool()
+            monitor.end_stage("pool_building")
+            return
+
+        logger.info(f"Created {len(all_chunks):,} chunks from {doc_count:,} pool documents")
+
+        logger.info("Encoding pool chunks...")
+        embeddings = self._encode_pool_texts(all_chunks)
+
+        self.global_neg_pool = embeddings.to(DEVICE, dtype=DTYPE)
+        self.global_neg_texts = all_chunks
+        self.chunk_usage_counts = [0] * len(all_chunks)
+
+        logger.info(f"Saving pool cache to {POOL_CACHE_DIR}...")
+        try:
+            torch.save({
+                'embeddings': embeddings.cpu()
+            }, cache_path)
+
+            save_pkl_atomic({
+                'texts': all_chunks
+            }, metadata_path)
+
+            logger.info(f"Pool cache saved successfully")
+        except Exception as e:
+            logger.warning(f"Failed to save cache: {e}")
+
+        logger.info(f"Built negative pool: {self.global_neg_pool.shape[0]:,} chunk embeddings")
+        monitor.end_stage("pool_building")
+
+    def _load_from_shards(self):
+        logger.info("Loading pool from sharded cache...")
+        monitor.start_stage("loading_sharded_pool")
+
+        pool_index_path = os.path.join(POOL_CACHE_DIR, "pool_index.json")
+        if not os.path.exists(pool_index_path):
+            pool_index_path = os.path.join(POOL_CACHE_DIR, "pool_index.pkl")
+
+        if pool_index_path.endswith('.json'):
+            with open(pool_index_path, 'r') as f:
+                index = json.load(f)
+        else:
+            index = load_pkl_safe(pool_index_path, {})
+
+        num_shards = index.get('num_shards', 238)
+        logger.info(f"Found {num_shards} shards")
 
         all_embeddings = []
         all_texts = []
-        total_samples = 0
-        target_pool_size = min(100000, NEG_CANDIDATES * 5)
 
-        shard_ids = list(self.shard_paths.keys())
-        random.shuffle(shard_ids)
+        for shard_id in tqdm(range(1, num_shards + 1), desc="Loading pool shards"):
+            embed_path = os.path.join(POOL_CACHE_DIR, f"pool_embeds_{shard_id:05d}.pt")
+            text_path = os.path.join(POOL_CACHE_DIR, f"pool_texts_{shard_id:05d}.pkl")
 
-        samples_per_shard = target_pool_size // len(shard_ids) if shard_ids else 0
-
-        for shard_id in shard_ids:
-            if total_samples >= target_pool_size:
-                break
-
-            shard = self.get_shard(shard_id)
-            if shard is None or shard.numel() == 0:
+            if not os.path.exists(embed_path) or not os.path.exists(text_path):
                 continue
 
-            meta = self.shard_metas.get(shard_id, [])
-            if not meta:
+            try:
+                shard_data = torch.load(embed_path, map_location='cpu', weights_only=False)
+                shard_texts = load_pkl_safe(text_path, [])
+
+                if isinstance(shard_data, dict):
+                    if 'embeddings' in shard_data:
+                        shard_embeds = shard_data['embeddings']
+                    elif 'emb' in shard_data:
+                        shard_embeds = shard_data['emb']
+                    else:
+                        shard_embeds = list(shard_data.values())[0]
+                else:
+                    shard_embeds = shard_data
+
+                all_embeddings.append(shard_embeds.cpu())
+                all_texts.extend(shard_texts)
+
+            except Exception as e:
+                logger.error(f"Failed to load shard {shard_id}: {e}")
                 continue
 
-            n_samples = min(samples_per_shard, len(meta), shard.shape[0], target_pool_size - total_samples)
-            if n_samples > 0:
-                indices = torch.randperm(shard.shape[0])[:n_samples].cpu()
-                sampled_embeddings = shard[indices]
-                sampled_texts = [meta[i][2] if i < len(meta) else f"text_{i}" for i in indices]
-
-                all_embeddings.append(sampled_embeddings.cpu())
-                all_texts.extend(sampled_texts)
-                total_samples += n_samples
-
-        if all_embeddings:
-            self.global_neg_pool = torch.cat(all_embeddings, dim=0).to(DEVICE, dtype=DTYPE)
-            self.global_neg_texts = all_texts
-            logger.info(f"Built global negative pool: {self.global_neg_pool.shape[0]:,} embeddings")
-        else:
-            logger.warning("Failed to build global negative pool - creating dummy pool")
-            dim = 768
-            self.global_neg_pool = torch.randn(1000, dim, dtype=DTYPE, device=DEVICE)
-            self.global_neg_texts = [f"dummy_text_{i}" for i in range(1000)]
-
-        monitor.end_stage("global_negative_pool")
-
-    def get_shard(self, shard_id: int) -> Optional[torch.Tensor]:
-        if shard_id in self.shard_cache:
-            self.cache_hits += 1
-            self.access_counts[shard_id] += 1
-            return self.shard_cache[shard_id]
-
-        if shard_id not in self.shard_paths:
-            logger.warning(f"Shard {shard_id} not found")
-            return None
-
-        self.cache_misses += 1
-
-        try:
-            shard = torch.load(self.shard_paths[shard_id],
-                               map_location=DEVICE, weights_only=True)
-
-            if DTYPE == torch.float16 and shard.dtype != torch.float16:
-                shard = shard.to(dtype=torch.float16)
-
-            if len(self.shard_cache) >= MAX_SHARD_CACHE:
-                self._evict_least_used()
-
-            self.shard_cache[shard_id] = shard
-            self.access_counts[shard_id] = 1
-
-            logger.debug(f"Loaded shard {shard_id} ({shard.shape[0]:,} embeddings)")
-            return shard
-
-        except Exception as e:
-            logger.error(f"Failed to load shard {shard_id}: {e}")
-            return None
-
-    def _evict_least_used(self):
-        if not self.shard_cache:
+        if not all_embeddings:
+            logger.error("No shards loaded successfully!")
+            self._create_dummy_pool()
+            monitor.end_stage("loading_sharded_pool")
             return
 
-        sorted_shards = sorted(self.access_counts.items(), key=lambda x: x[1])
-        to_remove = len(self.shard_cache) - MAX_SHARD_CACHE // 2
+        logger.info(f"Concatenating {len(all_embeddings)} shards...")
+        embeddings = torch.cat(all_embeddings, dim=0)
 
-        for shard_id, _ in sorted_shards[:to_remove]:
-            if shard_id in self.shard_cache:
-                del self.shard_cache[shard_id]
-                del self.access_counts[shard_id]
+        total_chunks = embeddings.shape[0]
+        logger.info(f"Total chunks: {total_chunks:,}")
 
+        if total_chunks > MAX_POOL_SIZE:
+            logger.info(f"Sampling {MAX_POOL_SIZE:,} chunks from {total_chunks:,} for faster similarity search")
+            indices = torch.randperm(total_chunks)[:MAX_POOL_SIZE]
+            embeddings = embeddings[indices]
+            all_texts = [all_texts[i] for i in indices.tolist()]
+
+        logger.info("Moving embeddings to device...")
+        self.global_neg_pool = embeddings.to(DEVICE, dtype=DTYPE)
+        self.global_neg_texts = all_texts
+        self.chunk_usage_counts = [0] * len(all_texts)
+
+        del all_embeddings
         aggressive_cleanup()
-        logger.debug(f"Evicted {to_remove} shards from cache")
 
-    def get_cache_stats(self) -> Dict:
-        total_requests = self.cache_hits + self.cache_misses
-        hit_rate = (self.cache_hits / total_requests * 100) if total_requests > 0 else 0
+        logger.info(f"Successfully loaded {self.global_neg_pool.shape[0]:,} chunk embeddings")
+        logger.info(f"Pool ready with {len(self.global_neg_texts):,} negative chunks")
+        monitor.end_stage("loading_sharded_pool")
+
+    def _encode_pool_texts(self, texts: List[str]) -> torch.Tensor:
+        batch_size = EMBEDDING_BATCH_SIZE
+        embeddings = []
+
+        with torch.no_grad():
+            batches = [texts[i:i + batch_size] for i in range(0, len(texts), batch_size)]
+
+            for batch_texts in tqdm(batches, desc="Encoding pool chunks"):
+                emb = self.model.encode(
+                    batch_texts,
+                    convert_to_tensor=True,
+                    batch_size=len(batch_texts),
+                    normalize_embeddings=True,
+                    show_progress_bar=False
+                )
+
+                if DTYPE == torch.float16:
+                    emb = emb.to(dtype=torch.float16)
+
+                embeddings.append(emb.cpu())
+                monitor.increment("pool_embeddings_generated", len(batch_texts))
+
+                if len(embeddings) % 10 == 0 and check_memory_usage():
+                    aggressive_cleanup()
+
+        return torch.cat(embeddings, dim=0)
+
+    def _create_dummy_pool(self):
+        logger.warning("Creating dummy negative pool")
+        dim = 768
+        self.global_neg_pool = torch.randn(1000, dim, dtype=DTYPE, device=DEVICE)
+        self.global_neg_texts = [f"dummy_text_{i}" for i in range(1000)]
+        self.chunk_usage_counts = [0] * 1000
+
+    def get_available_indices(self) -> torch.Tensor:
+        available = [i for i, count in enumerate(self.chunk_usage_counts) if count < MAX_CHUNK_USAGE]
+        return torch.tensor(available, dtype=torch.long)
+
+    def increment_usage(self, indices: List[int]):
+        for idx in indices:
+            if 0 <= idx < len(self.chunk_usage_counts):
+                self.chunk_usage_counts[idx] += 1
+
+    def get_usage_stats(self) -> Dict:
+        total = len(self.chunk_usage_counts)
+        exhausted = sum(1 for c in self.chunk_usage_counts if c >= MAX_CHUNK_USAGE)
+        avg_usage = sum(self.chunk_usage_counts) / total if total > 0 else 0
 
         return {
-            "hit_rate": hit_rate,
-            "cache_size": len(self.shard_cache),
-            "total_requests": total_requests
+            "total_chunks": total,
+            "exhausted_chunks": exhausted,
+            "available_chunks": total - exhausted,
+            "avg_usage": avg_usage,
+            "exhausted_percent": (exhausted / total * 100) if total > 0 else 0
         }
 
 
 class FastDatasetProcessor:
-    def __init__(self, model: SentenceTransformer, shard_manager: OptimizedShardManager):
+    def __init__(self, model: SentenceTransformer, pool_manager: NegativePoolManager):
         self.model = model
-        self.shard_manager = shard_manager
+        self.pool_manager = pool_manager
         self.pos_embeddings_cache = {}
         self.processed_queries = 0
         self.generated_triplets = 0
@@ -373,13 +481,12 @@ class FastDatasetProcessor:
             return torch.empty(0, dim, dtype=DTYPE, device=DEVICE)
 
         batch_size = batch_size or EMBEDDING_BATCH_SIZE
-        monitor.start_stage(f"encoding_{desc}")
 
         with torch.no_grad():
             embeddings = []
             batches = [texts[i:i + batch_size] for i in range(0, len(texts), batch_size)]
 
-            for batch_texts in tqdm(batches, desc=desc, leave=False):
+            for idx, batch_texts in enumerate(batches):
                 emb = self.model.encode(
                     batch_texts,
                     convert_to_tensor=True,
@@ -394,108 +501,194 @@ class FastDatasetProcessor:
                 embeddings.append(emb.to(DEVICE))
                 monitor.increment("embeddings_generated", len(batch_texts))
 
-                if len(embeddings) % 10 == 0 and check_memory_usage():
+                if idx % 20 == 0:
                     aggressive_cleanup()
 
             result = torch.cat(embeddings, dim=0) if embeddings else torch.empty(0,
                                                                                  self.model.get_sentence_embedding_dimension(),
                                                                                  dtype=DTYPE, device=DEVICE)
 
-        monitor.end_stage(f"encoding_{desc}")
-        logger.debug(f"Encoded {len(texts)} {desc} -> {result.shape}")
         return result
 
-    def mine_negatives_with_guaranteed_fallback(self, query_embs: torch.Tensor,
-                                                pos_sims: List[float],
-                                                target_margin: float,
-                                                tolerance: float) -> List[Tuple[str, float, str]]:
-        monitor.start_stage("negative_mining")
+    def mine_negatives_with_usage_limit(self, query_embs: torch.Tensor,
+                                        pos_sims: List[float],
+                                        target_margin: float,
+                                        tolerance: float) -> List[Tuple[str, float, str, int]]:
 
-        if self.shard_manager.global_neg_pool is None:
-            logger.error("No global negative pool available - this should not happen!")
-            return [("fallback_negative", 0.0, "emergency")] * len(pos_sims)
+        if self.pool_manager.global_neg_pool is None:
+            logger.error("No global negative pool available!")
+            return [("fallback_negative", 0.0, "emergency", -1)] * len(pos_sims)
 
-        neg_pool = self.shard_manager.global_neg_pool
-        neg_texts = self.shard_manager.global_neg_texts
+        available_indices = self.pool_manager.get_available_indices()
 
-        similarities = util.cos_sim(query_embs, neg_pool)
+        if len(available_indices) == 0:
+            logger.warning("All chunks exhausted! Resetting usage counts")
+            self.pool_manager.chunk_usage_counts = [0] * len(self.pool_manager.chunk_usage_counts)
+            available_indices = self.pool_manager.get_available_indices()
+
+        logger.debug(f"Mining negatives for {len(query_embs)} queries from {len(available_indices)} available chunks")
+
+        neg_pool = self.pool_manager.global_neg_pool[available_indices]
+        neg_texts = [self.pool_manager.global_neg_texts[i] for i in available_indices.tolist()]
 
         results = []
-        margin_low = max(0.01, target_margin - tolerance)
+        selected_indices = []
+        margin_low = target_margin - tolerance
         margin_high = target_margin + tolerance
+
+        logger.debug("Computing similarity matrix...")
+        similarities = util.cos_sim(query_embs, neg_pool)
+        logger.debug("Similarity computation complete")
 
         for i, pos_sim in enumerate(pos_sims):
             query_sims = similarities[i]
 
-            valid_mask = (query_sims >= MIN_NEG_SIM) & (query_sims <= min(pos_sim * 0.95, MAX_POS_NEG_SIM))
-            valid_indices = torch.where(valid_mask)[0]
+            valid_mask = (query_sims >= MIN_NEG_SIM) & (query_sims <= min(pos_sim * 0.88, MAX_POS_NEG_SIM))
+            valid_local_indices = torch.where(valid_mask)[0]
 
-            if len(valid_indices) == 0:
-                best_idx = torch.randint(0, len(neg_texts), (1,))[0]
-                results.append((neg_texts[int(best_idx)], float(query_sims[best_idx]), "random_fallback"))
-                monitor.increment("random_fallback_negatives")
+            if len(valid_local_indices) == 0:
+                fallback_mask = query_sims < pos_sim * 0.90
+                fallback_local_indices = torch.where(fallback_mask)[0]
+                if len(fallback_local_indices) > 0:
+                    best_local_idx = fallback_local_indices[torch.argmax(query_sims[fallback_local_indices])]
+                    best_global_idx = available_indices[best_local_idx].item()
+                    results.append(
+                        (neg_texts[best_local_idx], float(query_sims[best_local_idx]), "fallback", best_global_idx))
+                    selected_indices.append(best_global_idx)
+                    monitor.increment("fallback_negatives")
+                else:
+                    best_local_idx = torch.randint(0, len(neg_texts), (1,))[0]
+                    best_global_idx = available_indices[best_local_idx].item()
+                    results.append((neg_texts[best_local_idx], float(query_sims[best_local_idx]), "random_fallback",
+                                    best_global_idx))
+                    selected_indices.append(best_global_idx)
+                    monitor.increment("random_fallback_negatives")
                 continue
 
-            valid_sims = query_sims[valid_indices]
+            valid_sims = query_sims[valid_local_indices]
             margins = pos_sim - valid_sims
 
             semi_hard_mask = (margins >= margin_low) & (margins <= margin_high)
-            semi_hard_indices = valid_indices[semi_hard_mask]
+            semi_hard_local_indices = valid_local_indices[semi_hard_mask]
 
-            if len(semi_hard_indices) > 0:
-                best_local_idx = torch.argmin(torch.abs(margins[semi_hard_mask] - target_margin))
-                best_idx = semi_hard_indices[best_local_idx]
-                best_sim = float(valid_sims[torch.where(valid_indices == best_idx)[0][0]])
-                text = neg_texts[int(best_idx)]
-                results.append((text, best_sim, "semi-hard"))
+            hard_mask = margins > margin_high
+            hard_local_indices = valid_local_indices[hard_mask]
+
+            easy_mask = (margins >= MIN_MARGIN) & (margins < margin_low)
+            easy_local_indices = valid_local_indices[easy_mask]
+
+            if len(semi_hard_local_indices) > 0:
+                semi_hard_margins = margins[semi_hard_mask]
+                best_within_semi = torch.argmin(torch.abs(semi_hard_margins - target_margin))
+                best_local_idx = semi_hard_local_indices[best_within_semi]
+                best_global_idx = available_indices[best_local_idx].item()
+                best_sim = float(valid_sims[torch.where(valid_local_indices == best_local_idx)[0][0]])
+                text = neg_texts[best_local_idx]
+                results.append((text, best_sim, "semi-hard", best_global_idx))
+                selected_indices.append(best_global_idx)
                 monitor.increment("semi_hard_negatives")
+            elif len(hard_local_indices) > 0:
+                hard_margins = margins[hard_mask]
+                best_within_hard = torch.argmin(hard_margins)
+                best_local_idx = hard_local_indices[best_within_hard]
+                best_global_idx = available_indices[best_local_idx].item()
+                best_sim = float(valid_sims[torch.where(valid_local_indices == best_local_idx)[0][0]])
+                text = neg_texts[best_local_idx]
+                results.append((text, best_sim, "hard", best_global_idx))
+                selected_indices.append(best_global_idx)
+                monitor.increment("hard_negatives")
+            elif len(easy_local_indices) > 0:
+                easy_margins = margins[easy_mask]
+                best_within_easy = torch.argmax(easy_margins)
+                best_local_idx = easy_local_indices[best_within_easy]
+                best_global_idx = available_indices[best_local_idx].item()
+                best_sim = float(valid_sims[torch.where(valid_local_indices == best_local_idx)[0][0]])
+                text = neg_texts[best_local_idx]
+                results.append((text, best_sim, "easy", best_global_idx))
+                selected_indices.append(best_global_idx)
+                monitor.increment("easy_negatives")
             else:
-                hard_mask = margins > target_margin
-                hard_indices = valid_indices[hard_mask]
+                best_within_valid = torch.argmax(margins)
+                best_local_idx = valid_local_indices[best_within_valid]
+                best_global_idx = available_indices[best_local_idx].item()
+                best_sim = float(valid_sims[best_within_valid])
+                text = neg_texts[best_local_idx]
+                results.append((text, best_sim, "valid_fallback", best_global_idx))
+                selected_indices.append(best_global_idx)
+                monitor.increment("valid_fallback_negatives")
 
-                if len(hard_indices) > 0:
-                    best_local_idx = torch.argmin(margins[hard_mask])
-                    best_idx = hard_indices[best_local_idx]
-                    best_sim = float(valid_sims[torch.where(valid_indices == best_idx)[0][0]])
-                    text = neg_texts[int(best_idx)]
-                    results.append((text, best_sim, "hard"))
-                    monitor.increment("hard_negatives")
-                else:
-                    easy_mask = margins < margin_low
-                    easy_indices = valid_indices[easy_mask]
+        self.pool_manager.increment_usage(selected_indices)
+        logger.debug(f"Mined {len(results)} negatives")
 
-                    if len(easy_indices) > 0:
-                        best_local_idx = torch.argmax(margins[easy_mask])
-                        best_idx = easy_indices[best_local_idx]
-                        best_sim = float(valid_sims[torch.where(valid_indices == best_idx)[0][0]])
-                        text = neg_texts[int(best_idx)]
-                        results.append((text, best_sim, "easy"))
-                        monitor.increment("easy_negatives")
-                    else:
-                        best_local_idx = torch.randint(0, len(valid_indices), (1,))[0]
-                        best_idx = valid_indices[best_local_idx]
-                        best_sim = float(valid_sims[best_local_idx])
-                        text = neg_texts[int(best_idx)]
-                        results.append((text, best_sim, "valid_fallback"))
-                        monitor.increment("valid_fallback_negatives")
+        del similarities
+        aggressive_cleanup()
 
-        monitor.end_stage("negative_mining")
         return results
+
+    def save_checkpoint(self, triplets: List[Dict], checkpoint_num: int):
+        checkpoint_path = os.path.join(TRIPLET_CHECKPOINT_DIR, f"checkpoint_{checkpoint_num:05d}.json")
+        usage_path = os.path.join(TRIPLET_CHECKPOINT_DIR, f"usage_{checkpoint_num:05d}.pkl")
+
+        with open(checkpoint_path, "w", encoding="utf-8") as f:
+            json.dump(triplets, f, ensure_ascii=False, indent=2)
+
+        save_pkl_atomic({
+            'chunk_usage_counts': self.pool_manager.chunk_usage_counts,
+            'num_triplets': len(triplets)
+        }, usage_path)
+
+        logger.info(f"Checkpoint saved: {len(triplets):,} triplets")
+
+    def load_latest_checkpoint(self) -> Tuple[List[Dict], int]:
+        if not os.path.exists(TRIPLET_CHECKPOINT_DIR):
+            return [], 0
+
+        checkpoints = [f for f in os.listdir(TRIPLET_CHECKPOINT_DIR) if
+                       f.startswith("checkpoint_") and f.endswith(".json")]
+
+        if not checkpoints:
+            return [], 0
+
+        latest = max(checkpoints)
+        checkpoint_num = int(latest.split("_")[1].split(".")[0])
+
+        checkpoint_path = os.path.join(TRIPLET_CHECKPOINT_DIR, latest)
+        usage_path = os.path.join(TRIPLET_CHECKPOINT_DIR, f"usage_{checkpoint_num:05d}.pkl")
+
+        logger.info(f"Loading checkpoint {checkpoint_num}...")
+
+        with open(checkpoint_path, "r", encoding="utf-8") as f:
+            triplets = json.load(f)
+
+        if os.path.exists(usage_path):
+            usage_data = load_pkl_safe(usage_path, {})
+            if 'chunk_usage_counts' in usage_data:
+                self.pool_manager.chunk_usage_counts = usage_data['chunk_usage_counts']
+
+        logger.info(f"Loaded {len(triplets):,} triplets from checkpoint")
+
+        return triplets, checkpoint_num
 
     def process_dataset_batch(self, documents: List[Dict],
                               dataset_idx: int, total_datasets: int) -> List[Dict]:
-        logger.info(f"Processing dataset batch #{dataset_idx}/{total_datasets} ({len(documents):,} docs)")
-        monitor.start_stage(f"batch_processing_{dataset_idx}")
+        logger.info(f"Processing dataset with {len(documents):,} docs for 125K triplets")
 
+        all_triplets, last_checkpoint = self.load_latest_checkpoint()
+
+        if len(all_triplets) >= TARGET_TRIPLETS:
+            logger.info(f"Already have {len(all_triplets):,} triplets from checkpoints, done!")
+            return all_triplets[:TARGET_TRIPLETS]
+
+        logger.info("Loading document cache...")
         records = []
 
         oids = [doc["_id"]["$oid"] for doc in documents]
-        logger.debug(f"Loading cache for {len(oids)} documents...")
 
         with ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
             cache_futures = {oid: executor.submit(self._load_cache_doc, oid) for oid in oids}
             cache_data = {oid: future.result() for oid, future in cache_futures.items()}
 
+        logger.info("Extracting query-answer pairs...")
         for doc in documents:
             oid = doc["_id"]["$oid"]
             cache = cache_data.get(oid, {})
@@ -517,84 +710,114 @@ class FastDatasetProcessor:
                     })
 
         if not records:
-            logger.warning(f"No valid records in batch #{dataset_idx} - creating dummy triplets")
-            dummy_triplets = []
-            for i in range(min(TARGET_TRIPLETS, 1000)):
-                dummy_triplets.append({
-                    "doc_id": f"dummy_{i}",
-                    "question": f"What is the answer to question {i}?",
-                    "positive": f"This is the positive answer for question {i}.",
-                    "negative": f"This is the negative answer for question {i}.",
-                    "pos_sim": 0.8,
-                    "neg_sim": 0.3,
-                    "margin": 0.5,
-                    "type": "dummy"
-                })
-            return dummy_triplets
+            logger.error("No valid records found!")
+            return []
 
         logger.info(f"Extracted {len(records):,} query-answer pairs")
+
         random.shuffle(records)
 
-        if len(records) > TARGET_TRIPLETS * 5:
-            records = records[:TARGET_TRIPLETS * 5]
-            logger.info(f"Limited to {len(records):,} records for efficiency")
+        del cache_data
+        aggressive_cleanup()
 
-        query_texts = [f"query: {rec['query']}" for rec in records]
-        query_embeddings = self.encode_batch_optimized(query_texts, "queries", QUERY_BATCH_SIZE)
+        logger.info(f"Starting triplet generation (have {len(all_triplets):,}, need {TARGET_TRIPLETS:,})")
 
-        target_margin, tolerance, difficulty = self._get_curriculum_params(dataset_idx, total_datasets)
-        logger.info(f"Curriculum params - Margin: {target_margin:.3f}±{tolerance:.3f}, Difficulty: {difficulty:.2f}")
+        batch_size = 2000
+        checkpoint_counter = last_checkpoint
 
-        triplets = self._generate_triplets_batch_guaranteed(records, query_embeddings,
-                                                            target_margin, tolerance, difficulty)
+        for batch_start in range(0, len(records), batch_size):
+            if len(all_triplets) >= TARGET_TRIPLETS:
+                logger.info(f"Reached target of {TARGET_TRIPLETS:,} triplets!")
+                break
 
-        if len(triplets) < TARGET_TRIPLETS // 2:
-            logger.warning(f"Only generated {len(triplets)} triplets, padding with synthetic ones")
-            triplets.extend(self._generate_synthetic_triplets(TARGET_TRIPLETS - len(triplets)))
+            batch_end = min(batch_start + batch_size, len(records))
+            batch_records = records[batch_start:batch_end]
 
-        output_file = os.path.join(DATASETS_DIR, f"dataset_{dataset_idx}.json")
+            logger.info(f"Processing batch {batch_start:,}-{batch_end:,} ({len(batch_records):,} records)")
+
+            usage_stats = self.pool_manager.get_usage_stats()
+            logger.info(
+                f"Pool: {usage_stats['available_chunks']:,} available, {usage_stats['exhausted_percent']:.1f}% exhausted")
+
+            logger.info("Encoding queries...")
+            query_texts = [f"query: {rec['query']}" for rec in batch_records]
+            query_embeddings = self.encode_batch_optimized(query_texts, f"queries", QUERY_BATCH_SIZE)
+            logger.info(f"Encoded {len(query_embeddings)} query embeddings")
+
+            target_margin, tolerance, difficulty = self._get_curriculum_params(dataset_idx, total_datasets)
+
+            logger.info(f"Generating triplets (margin={target_margin:.2f}±{tolerance:.2f})...")
+            batch_triplets = self._generate_triplets_batch_guaranteed(
+                batch_records, query_embeddings, target_margin, tolerance, difficulty
+            )
+
+            all_triplets.extend(batch_triplets)
+            logger.info(
+                f"Generated {len(batch_triplets):,} triplets (total: {len(all_triplets):,}/{TARGET_TRIPLETS:,})")
+
+            del query_embeddings
+            del batch_records
+            aggressive_cleanup()
+
+            if len(all_triplets) % CHECKPOINT_EVERY < len(batch_triplets) or len(all_triplets) >= TARGET_TRIPLETS:
+                checkpoint_counter += 1
+                logger.info(f"Saving checkpoint {checkpoint_counter}...")
+                self.save_checkpoint(all_triplets, checkpoint_counter)
+
+        if len(all_triplets) > TARGET_TRIPLETS:
+            logger.info(f"Sampling best {TARGET_TRIPLETS:,} triplets from {len(all_triplets):,}")
+
+            ideal_margin = 0.20
+            all_triplets.sort(key=lambda x: abs(x.get("margin", 0) - ideal_margin))
+            all_triplets = all_triplets[:TARGET_TRIPLETS]
+
+            random.shuffle(all_triplets)
+
+        logger.info("Saving final dataset...")
+        output_file = os.path.join(DATASETS_DIR, f"dataset_1.json")
         with open(output_file, "w", encoding="utf-8") as f:
-            json.dump(triplets, f, ensure_ascii=False, indent=2)
+            json.dump(all_triplets, f, ensure_ascii=False, indent=2)
 
-        monitor.end_stage(f"batch_processing_{dataset_idx}")
+        logger.info("Computing statistics...")
+        type_counts = defaultdict(int)
+        margins = []
+        pos_sims = []
+        neg_sims = []
 
-        logger.info(f"Generated {len(triplets):,} triplets for dataset #{dataset_idx}")
-        logger.info(f"Saved to {output_file}")
+        for t in all_triplets:
+            type_counts[t.get("type", "unknown")] += 1
+            if "margin" in t:
+                margins.append(t["margin"])
+            if "pos_sim" in t:
+                pos_sims.append(t["pos_sim"])
+            if "neg_sim" in t:
+                neg_sims.append(t["neg_sim"])
 
-        cache_stats = self.shard_manager.get_cache_stats()
-        logger.debug(f"Shard cache hit rate: {cache_stats['hit_rate']:.1f}%")
+        logger.info(f"Dataset Summary:")
+        logger.info(f"  Total triplets: {len(all_triplets):,}")
+        logger.info(f"  Triplet types: {dict(type_counts)}")
 
-        return triplets
+        if margins:
+            logger.info(
+                f"  Margins - Mean: {np.mean(margins):.3f}, Std: {np.std(margins):.3f}, Median: {np.median(margins):.3f}")
+        if pos_sims:
+            logger.info(f"  Positive sims - Mean: {np.mean(pos_sims):.3f}, Std: {np.std(pos_sims):.3f}")
+        if neg_sims:
+            logger.info(f"  Negative sims - Mean: {np.mean(neg_sims):.3f}, Std: {np.std(neg_sims):.3f}")
 
-    def _generate_synthetic_triplets(self, count: int) -> List[Dict]:
-        synthetic_triplets = []
-        for i in range(count):
-            synthetic_triplets.append({
-                "doc_id": f"synthetic_{i}",
-                "question": f"What is the meaning of synthetic question {i}?",
-                "positive": f"The answer to synthetic question {i} is clearly explained here with relevant information.",
-                "negative": f"This is completely unrelated information about topic {i} that doesn't answer the question.",
-                "pos_sim": 0.75 + random.random() * 0.2,
-                "neg_sim": 0.2 + random.random() * 0.3,
-                "margin": 0.3 + random.random() * 0.4,
-                "type": "synthetic"
-            })
-        return synthetic_triplets
+        final_usage_stats = self.pool_manager.get_usage_stats()
+        logger.info(f"Final pool usage: {final_usage_stats}")
+
+        return all_triplets
 
     def _load_cache_doc(self, oid: str) -> Dict:
         cache_path = os.path.join(CACHE_DIR, f"{oid}.pkl")
         return load_pkl_safe(cache_path, {})
 
     def _get_curriculum_params(self, dataset_idx: int, total_datasets: int) -> Tuple[float, float, float]:
-        if total_datasets <= 1:
-            progress = 1.0
-        else:
-            progress = (dataset_idx - 1) / (total_datasets - 1)
-
-        margin = MARGIN_START + progress * (MARGIN_END - MARGIN_START)
-        margin = max(margin, MIN_MARGIN)
-        tolerance = MARGIN_TOL_START + progress * (MARGIN_TOL_END - MARGIN_TOL_START)
-        difficulty = 0.3 + 0.7 * progress
+        margin = 0.20
+        tolerance = 0.08
+        difficulty = 0.6
 
         return float(margin), float(tolerance), float(difficulty)
 
@@ -603,12 +826,16 @@ class FastDatasetProcessor:
                                             target_margin: float, tolerance: float,
                                             difficulty: float) -> List[Dict]:
         triplets = []
-        batch_size = 512
+        batch_size = 128
 
-        for i in tqdm(range(0, len(records), batch_size), desc="Mining triplets"):
-            batch_records = records[i:i + batch_size]
-            batch_query_embs = query_embeddings[i:i + batch_size]
+        total_batches = (len(records) + batch_size - 1) // batch_size
+        logger.info(f"Processing {len(records)} records in {total_batches} batches of {batch_size}")
 
+        for batch_idx in range(0, len(records), batch_size):
+            batch_records = records[batch_idx:batch_idx + batch_size]
+            batch_query_embs = query_embeddings[batch_idx:batch_idx + batch_size]
+
+            logger.debug(f"Finding positives for batch {batch_idx // batch_size + 1}/{total_batches}...")
             positive_results = self._find_positives_batch_guaranteed(batch_query_embs, batch_records)
 
             valid_indices = []
@@ -626,13 +853,14 @@ class FastDatasetProcessor:
 
             valid_query_embs = batch_query_embs[valid_indices]
 
-            negative_results = self.mine_negatives_with_guaranteed_fallback(
+            logger.debug(f"Mining {len(valid_query_embs)} negatives...")
+            negative_results = self.mine_negatives_with_usage_limit(
                 valid_query_embs, pos_sims, target_margin, tolerance
             )
 
             for (rec, pos_result), neg_result in zip(valid_records, negative_results):
                 pos_text, pos_sim = pos_result
-                neg_text, neg_sim, neg_type = neg_result
+                neg_text, neg_sim, neg_type, neg_idx = neg_result
 
                 triplet = {
                     "doc_id": rec["oid"],
@@ -642,38 +870,62 @@ class FastDatasetProcessor:
                     "pos_sim": float(pos_sim),
                     "neg_sim": float(neg_sim),
                     "margin": float(pos_sim - neg_sim),
-                    "type": neg_type
+                    "type": neg_type,
+                    "pool_chunk_idx": neg_idx
                 }
                 triplets.append(triplet)
                 monitor.increment("triplets_generated")
 
-            if i % (batch_size * 10) == 0:
-                if check_memory_usage():
-                    aggressive_cleanup()
+            if batch_idx % (batch_size * 5) == 0:
+                aggressive_cleanup()
 
+        logger.info(f"Generated {len(triplets)} triplets from this batch")
         return triplets
 
     def _find_positives_batch_guaranteed(self, query_embs: torch.Tensor,
                                          records: List[Dict]) -> List[Optional[Tuple[str, float]]]:
         results = []
 
+        all_pos_texts = []
+        record_indices = []
+        text_to_record = []
+
         for i, record in enumerate(records):
             correct_chunks = record["correct_chunks"]
             if not correct_chunks:
-                fallback_text = f"This is a fallback positive answer for the query about {record['query'][:50]}"
-                results.append((fallback_text, 0.6))
+                results.append((f"Fallback positive for {record['query'][:50]}", 0.6))
                 continue
 
+            start_idx = len(all_pos_texts)
             pos_texts = [f"passage: {chunk}" for chunk in correct_chunks]
-            pos_embs = self.encode_batch_optimized(pos_texts, "positives", min(128, len(pos_texts)))
+            all_pos_texts.extend(pos_texts)
 
-            if pos_embs.numel() == 0:
-                fallback_text = correct_chunks[0] if correct_chunks else "Fallback positive text"
-                results.append((fallback_text, 0.5))
+            for j in range(len(pos_texts)):
+                record_indices.append(i)
+                text_to_record.append((i, correct_chunks[j]))
+
+        if not all_pos_texts:
+            return results
+
+        pos_embs = self.encode_batch_optimized(all_pos_texts, "positives", EMBEDDING_BATCH_SIZE)
+
+        emb_idx = 0
+        for i, record in enumerate(records):
+            if i < len(results):
+                continue
+
+            correct_chunks = record["correct_chunks"]
+            num_chunks = len(correct_chunks)
+
+            chunk_embs = pos_embs[emb_idx:emb_idx + num_chunks]
+            emb_idx += num_chunks
+
+            if chunk_embs.numel() == 0:
+                results.append((correct_chunks[0], 0.5))
                 continue
 
             query_emb = query_embs[i:i + 1]
-            similarities = util.cos_sim(query_emb, pos_embs)[0]
+            similarities = util.cos_sim(query_emb, chunk_embs)[0]
 
             best_idx = torch.argmax(similarities)
             best_sim = float(similarities[best_idx])
@@ -713,44 +965,14 @@ def load_model_optimized(model_name: str) -> SentenceTransformer:
     return model
 
 
-def estimate_datasets(total_docs: int) -> int:
-    if total_docs <= FIRST_BATCH_SIZE:
-        return 1
-
-    remaining = total_docs - FIRST_BATCH_SIZE
-    additional = (remaining + NEXT_BATCH_SIZE - 1) // NEXT_BATCH_SIZE
-    return 1 + additional
-
-
-def get_resume_point() -> Tuple[int, int]:
-    if not os.path.exists(DATASETS_DIR):
-        return 1, 0
-
-    dataset_files = [f for f in os.listdir(DATASETS_DIR)
-                     if f.startswith("dataset_") and f.endswith(".json")]
-
-    if not dataset_files:
-        return 1, 0
-
-    dataset_nums = [int(f.split("_")[1].split(".")[0]) for f in dataset_files]
-    last_dataset = max(dataset_nums)
-
-    if last_dataset == 1:
-        doc_index = FIRST_BATCH_SIZE
-    else:
-        doc_index = FIRST_BATCH_SIZE + (last_dataset - 1) * NEXT_BATCH_SIZE
-
-    next_dataset = last_dataset + 1
-
-    logger.info(f"Resuming from dataset #{next_dataset}, document index {doc_index:,}")
-    return next_dataset, doc_index
-
-
 def main(args):
-    logger.info("Starting Optimized Triplet Mining Process")
+    logger.info("Starting Optimized Triplet Mining for 125K Triplets with Sharded Pool")
     logger.info(f"   Device: {DEVICE} ({DTYPE})")
-    logger.info(f"   Target triplets per dataset: {TARGET_TRIPLETS:,}")
-    logger.info(f"   Batch sizes - Embedding: {EMBEDDING_BATCH_SIZE}, Query: {QUERY_BATCH_SIZE}")
+    logger.info(f"   Target: {TARGET_TRIPLETS:,} triplets in single dataset")
+    logger.info(f"   Max chunk usage: {MAX_CHUNK_USAGE}")
+    logger.info(f"   Chunk size: {CHUNK_SIZE}, Overlap: {CHUNK_OVERLAP}")
+    logger.info(f"   Checkpoint every: {CHECKPOINT_EVERY:,} triplets")
+    logger.info(f"   Similarity batch size: {SIMILARITY_BATCH_SIZE:,}")
 
     random.seed(42)
     torch.manual_seed(42)
@@ -761,152 +983,62 @@ def main(args):
 
     model = load_model_optimized(args.model)
 
-    logger.info("Initializing shard manager...")
-    shard_manager = OptimizedShardManager()
+    logger.info("Loading tokenizer for chunking...")
+    tokenizer = AutoTokenizer.from_pretrained("PORTULAN/albertina-1b5-portuguese-ptpt-encoder")
 
-    processor = FastDatasetProcessor(model, shard_manager)
+    logger.info("Initializing negative pool manager...")
+    pool_manager = NegativePoolManager(POOL_PATH, model, tokenizer)
+
+    processor = FastDatasetProcessor(model, pool_manager)
 
     monitor.end_stage("initialization")
 
-    logger.info("Analyzing dataset...")
-    monitor.start_stage("dataset_analysis")
+    logger.info("Loading all documents...")
+    monitor.start_stage("dataset_loading")
 
-    total_docs = 0
-    for chunk in load_json_chunked(DATASET_PATH, chunk_size=5000):
-        total_docs += len(chunk)
+    with open(DATASET_PATH, "r", encoding="utf-8") as f:
+        all_docs = json.load(f)
 
-    total_datasets = estimate_datasets(total_docs)
+    logger.info(f"Loaded {len(all_docs):,} documents")
+    monitor.end_stage("dataset_loading")
 
-    logger.info(f"Dataset Analysis Complete:")
-    logger.info(f"   Total documents: {total_docs:,}")
-    logger.info(f"   Estimated datasets: {total_datasets}")
-    logger.info(f"   First batch size: {FIRST_BATCH_SIZE:,}")
-    logger.info(f"   Subsequent batch size: {NEXT_BATCH_SIZE:,}")
+    logger.info("Processing all documents to generate 125K triplets...")
+    triplets = processor.process_dataset_batch(all_docs, 1, 1)
 
-    monitor.end_stage("dataset_analysis")
-
-    start_dataset_idx, start_doc_idx = get_resume_point()
-
-    prev_triplets = []
-    if start_dataset_idx > 1:
-        prev_file = os.path.join(DATASETS_DIR, f"dataset_{start_dataset_idx - 1}.json")
-        if os.path.exists(prev_file):
-            with open(prev_file, "r", encoding="utf-8") as f:
-                prev_triplets = json.load(f)
-            logger.info(f"Loaded {len(prev_triplets):,} triplets from previous dataset for overlap")
-
-    monitor.start_stage("dataset_processing")
-    current_doc_idx = 0
-    dataset_idx = start_dataset_idx
-
-    logger.info(f"Starting processing from dataset #{dataset_idx}")
-
-    data_iterator = load_json_chunked(DATASET_PATH, chunk_size=20000)
-    all_docs = []
-
-    for chunk in data_iterator:
-        all_docs.extend(chunk)
-
-    logger.info(f"Loaded all {len(all_docs):,} documents into memory")
-
-    while current_doc_idx < len(all_docs):
-        batch_size = FIRST_BATCH_SIZE if dataset_idx == 1 else NEXT_BATCH_SIZE
-
-        if current_doc_idx < start_doc_idx:
-            current_doc_idx = start_doc_idx
-
-        batch_end = min(current_doc_idx + batch_size, len(all_docs))
-        batch_docs = all_docs[current_doc_idx:batch_end]
-
-        if not batch_docs:
-            break
-
-        logger.info(f"Processing Dataset #{dataset_idx}/{total_datasets}")
-        logger.info(f"   Documents: {batch_end:,}/{len(all_docs):,} ({batch_end / len(all_docs) * 100:.1f}%)")
-
-        batch_start_time = time.time()
-
-        triplets = processor.process_dataset_batch(batch_docs, dataset_idx, total_datasets)
-
-        if prev_triplets and OVERLAP_PERCENT > 0:
-            overlap_count = min(int(len(prev_triplets) * OVERLAP_PERCENT), len(prev_triplets))
-            if overlap_count > 0:
-                sorted_prev = sorted(prev_triplets, key=lambda x: x.get("margin", 0))
-                overlap_triplets = sorted_prev[:overlap_count]
-                triplets.extend(overlap_triplets)
-                logger.info(f"Added {overlap_count:,} overlap triplets from previous dataset")
-
-        batch_time = time.time() - batch_start_time
-
-        type_counts = defaultdict(int)
-        margins = []
-        pos_sims = []
-        neg_sims = []
-
-        for t in triplets:
-            type_counts[t.get("type", "unknown")] += 1
-            if "margin" in t:
-                margins.append(t["margin"])
-            if "pos_sim" in t:
-                pos_sims.append(t["pos_sim"])
-            if "neg_sim" in t:
-                neg_sims.append(t["neg_sim"])
-
-        logger.info(f"Dataset #{dataset_idx} Summary:")
-        logger.info(f"Processing time: {batch_time:.1f}s")
-        logger.info(f"Total triplets: {len(triplets):,}")
-        logger.info(f"Triplet types: {dict(type_counts)}")
-
-        if margins:
-            logger.info(f"Margins - Mean: {np.mean(margins):.3f}, Std: {np.std(margins):.3f}")
-        if pos_sims:
-            logger.info(f"Positive sims - Mean: {np.mean(pos_sims):.3f}")
-        if neg_sims:
-            logger.info(f"Negative sims - Mean: {np.mean(neg_sims):.3f}")
-
-        prev_triplets = triplets
-        current_doc_idx = batch_end
-        dataset_idx += 1
-
-        if check_memory_usage():
-            aggressive_cleanup()
-
-        progress = (current_doc_idx / len(all_docs)) * 100
-        logger.info(f"Overall Progress: {progress:.1f}% ({current_doc_idx:,}/{len(all_docs):,} documents)")
-
-    monitor.end_stage("dataset_processing")
-
-    logger.info("Triplet Mining Complete!")
-
-    cache_stats = shard_manager.get_cache_stats()
-    logger.info(f"Final Statistics:")
-    logger.info(f"Shard cache hit rate: {cache_stats['hit_rate']:.1f}%")
-    logger.info(f"Total cache requests: {cache_stats['total_requests']:,}")
-    logger.info(f"Datasets generated: {dataset_idx - start_dataset_idx}")
+    logger.info(f"Successfully generated {len(triplets):,} triplets!")
+    logger.info(f"Saved to {os.path.join(DATASETS_DIR, 'dataset_1.json')}")
 
     monitor.log_summary()
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Optimized Triplet Mining for Sentence Transformers")
+    parser = argparse.ArgumentParser(description="Optimized Triplet Mining with Sharded Pool")
     parser.add_argument("--model", type=str, default="intfloat/multilingual-e5-base",
                         help="SentenceTransformer model name")
     parser.add_argument("--target-triplets", type=int, default=TARGET_TRIPLETS,
-                        help="Target number of triplets per dataset")
+                        help="Target number of triplets")
     parser.add_argument("--embedding-batch-size", type=int, default=EMBEDDING_BATCH_SIZE,
                         help="Batch size for embedding generation")
     parser.add_argument("--query-batch-size", type=int, default=QUERY_BATCH_SIZE,
                         help="Batch size for query processing")
     parser.add_argument("--neg-candidates", type=int, default=NEG_CANDIDATES,
                         help="Number of negative candidates to sample")
+    parser.add_argument("--max-chunk-usage", type=int, default=MAX_CHUNK_USAGE,
+                        help="Maximum times a chunk can be used as negative")
+    parser.add_argument("--chunk-size", type=int, default=CHUNK_SIZE,
+                        help="Size of pool document chunks")
+    parser.add_argument("--chunk-overlap", type=int, default=CHUNK_OVERLAP,
+                        help="Overlap between chunks")
+    parser.add_argument("--checkpoint-every", type=int, default=CHECKPOINT_EVERY,
+                        help="Save checkpoint every N triplets")
+    parser.add_argument("--similarity-batch", type=int, default=SIMILARITY_BATCH_SIZE,
+                        help="Batch size for similarity computation")
     parser.add_argument("--memory-aggressive", action="store_true",
-                        help="Enable aggressive memory management for low-memory systems")
-    parser.add_argument("--shard-cache-size", type=int, default=MAX_SHARD_CACHE,
-                        help="Maximum number of shards to keep in cache")
-    parser.add_argument("--pos-cache-size", type=int, default=POS_CACHE_MAX_ITEMS,
-                        help="Maximum positive embeddings to cache")
-    parser.add_argument("--resume", action="store_true",
-                        help="Resume from last completed dataset")
+                        help="Enable aggressive memory management")
+    parser.add_argument("--rebuild-pool", action="store_true",
+                        help="Force rebuild of pool cache")
+    parser.add_argument("--clear-checkpoints", action="store_true",
+                        help="Clear existing checkpoints and start fresh")
     parser.add_argument("--debug", action="store_true",
                         help="Enable debug logging")
 
@@ -914,25 +1046,45 @@ if __name__ == "__main__":
 
     if args.debug:
         logging.getLogger(__name__).setLevel(logging.DEBUG)
-        logger.info("🐛 Debug logging enabled")
+        logger.info("Debug logging enabled")
 
     TARGET_TRIPLETS = args.target_triplets
     EMBEDDING_BATCH_SIZE = args.embedding_batch_size
     QUERY_BATCH_SIZE = args.query_batch_size
     NEG_CANDIDATES = args.neg_candidates
-    MAX_SHARD_CACHE = args.shard_cache_size
-    POS_CACHE_MAX_ITEMS = args.pos_cache_size
+    MAX_CHUNK_USAGE = args.max_chunk_usage
+    CHUNK_SIZE = args.chunk_size
+    CHUNK_OVERLAP = args.chunk_overlap
+    CHECKPOINT_EVERY = args.checkpoint_every
+    SIMILARITY_BATCH_SIZE = args.similarity_batch
+
+    if args.clear_checkpoints:
+        import shutil
+
+        if os.path.exists(TRIPLET_CHECKPOINT_DIR):
+            shutil.rmtree(TRIPLET_CHECKPOINT_DIR)
+            logger.info(f"Cleared checkpoint directory")
+        ensure_dirs()
+
+    if args.rebuild_pool:
+        cache_path = os.path.join(POOL_CACHE_DIR, "pool_embeddings.pt")
+        metadata_path = os.path.join(POOL_CACHE_DIR, "pool_metadata.pkl")
+        if os.path.exists(cache_path):
+            os.remove(cache_path)
+            logger.info(f"Removed {cache_path}")
+        if os.path.exists(metadata_path):
+            os.remove(metadata_path)
+            logger.info(f"Removed {metadata_path}")
 
     if args.memory_aggressive:
-        EMBEDDING_BATCH_SIZE = max(256, EMBEDDING_BATCH_SIZE // 2)
-        QUERY_BATCH_SIZE = max(256, QUERY_BATCH_SIZE // 2)
-        MAX_SHARD_CACHE = max(10, MAX_SHARD_CACHE // 2)
-        POS_CACHE_MAX_ITEMS = max(50000, POS_CACHE_MAX_ITEMS // 2)
-        logger.info("Aggressive memory mode enabled - reduced batch sizes and cache")
+        EMBEDDING_BATCH_SIZE = max(32, EMBEDDING_BATCH_SIZE // 2)
+        QUERY_BATCH_SIZE = max(32, QUERY_BATCH_SIZE // 2)
+        SIMILARITY_BATCH_SIZE = max(512, SIMILARITY_BATCH_SIZE // 2)
+        logger.info("Aggressive memory mode enabled - reduced batch sizes")
 
     try:
         main(args)
-        logger.info("✅ Process completed successfully!")
+        logger.info("Process completed successfully!")
     except KeyboardInterrupt:
         logger.warning("Process interrupted by user")
         monitor.log_summary()

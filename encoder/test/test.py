@@ -267,10 +267,10 @@ class IREvaluator:
 
     def prepare_evaluation_data(self, eval_dataset_path: str, cache_dir: str = None) -> Tuple[
         List[str], List[str], List[str], Dict[str, str], List[str]]:
-        logger.info(f"Loading evaluation dataset from {eval_dataset_path}")
+        logger.info(f"Loading test dataset from {eval_dataset_path}")
         with open(eval_dataset_path, 'r', encoding='utf-8') as f:
             eval_data = json.load(f)
-        logger.info(f"Loaded {len(eval_data)} evaluation documents")
+        logger.info(f"Loaded {len(eval_data)} test documents")
 
         queries = []
         correct_doc_ids = []
@@ -278,7 +278,7 @@ class IREvaluator:
         all_doc_texts = []
         all_doc_oids = []
 
-        for doc in tqdm(eval_data, desc="Processing evaluation documents"):
+        for doc in tqdm(eval_data, desc="Processing test documents"):
             doc_id = doc["_id"]["$oid"]
             doc_text = ""
 

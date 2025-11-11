@@ -13,23 +13,23 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 class CacheProcessor:
     def __init__(
-        self,
-        tokenizer=None,
-        max_length=512,
-        split="all",
-        max_samples=None,
-        seed=42,
-        json_path="dataset.json",
-        cache_dir="cache",
-        enable_cache=True,
-        num_workers=4,
-        batch_size=100,
-        chunk_overlap=50,
-        use_chunking_threshold=400,
-        min_chunk_tokens=100,
-        preserve_structure=True,
+            self,
+            tokenizer=None,
+            max_length=512,
+            split="all",
+            max_samples=None,
+            seed=42,
+            json_path="dataset.json",
+            cache_dir="cache",
+            enable_cache=True,
+            num_workers=4,
+            batch_size=100,
+            chunk_overlap=128,
+            use_chunking_threshold=350,
+            min_chunk_tokens=150,
+            preserve_structure=True,
     ):
-        self.tokenizer = AutoTokenizer.from_pretrained("./models/albertina-1b5") if tokenizer is None else tokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained("PORTULAN/albertina-1b5-portuguese-ptpt-encoder") if tokenizer is None else tokenizer
         self.max_length = max_length
         self.effective_doc_length = max_length - 20
         self.chunk_overlap = chunk_overlap
@@ -59,20 +59,20 @@ class CacheProcessor:
 
     @classmethod
     def preprocess_only(
-        cls,
-        json_path: str,
-        cache_dir: str = "cache",
-        max_length: int = 512,
-        force_refresh: bool = False,
-        num_workers: int = 4,
-        batch_size: int = 100,
-        chunk_overlap: int = 50,
-        use_chunking_threshold: int = 400,
-        min_chunk_tokens: int = 100,
-        preserve_structure: bool = True,
+            cls,
+            json_path: str,
+            cache_dir: str = "cache",
+            max_length: int = 512,
+            force_refresh: bool = False,
+            num_workers: int = 4,
+            batch_size: int = 100,
+            chunk_overlap: int = 128,
+            use_chunking_threshold: int = 350,
+            min_chunk_tokens: int = 150,
+            preserve_structure: bool = True,
     ):
         processor = cls(
-            tokenizer=AutoTokenizer.from_pretrained("./models/albertina-1b5"),
+            tokenizer=AutoTokenizer.from_pretrained("PORTULAN/albertina-1b5-portuguese-ptpt-encoder"),
             max_length=max_length,
             split="all",
             max_samples=None,
@@ -95,7 +95,7 @@ class CacheProcessor:
         return processor
 
     def _create_worker_tokenizer(self):
-        return AutoTokenizer.from_pretrained("./models/albertina-1b5")
+        return AutoTokenizer.from_pretrained("PORTULAN/albertina-1b5-portuguese-ptpt-encoder")
 
     def _should_chunk_fast(self, text: str) -> bool:
         tokens = self.tokenizer.tokenize(text)
@@ -105,20 +105,28 @@ class CacheProcessor:
         tokens = self.tokenizer.tokenize(text)
         if len(tokens) <= self.effective_doc_length:
             return [text]
+
         chunks = []
-        stride = 32
+        stride = self.effective_doc_length - self.chunk_overlap
         start = 0
+
         while start < len(tokens):
             end = min(start + self.effective_doc_length, len(tokens))
             chunk_tokens = tokens[start:end]
+
             if len(chunk_tokens) >= self.min_chunk_tokens:
                 chunk_text = self.tokenizer.convert_tokens_to_string(chunk_tokens)
+
                 if metadata and start == 0:
                     chunk_text = f"{metadata}\n\n{chunk_text}"
+
                 chunks.append(chunk_text)
+
             if end >= len(tokens):
                 break
+
             start += stride
+
         return chunks if chunks else [text]
 
     def _extract_id(self, value):
@@ -175,7 +183,7 @@ class CacheProcessor:
             return {"correct_chunks": [text], "is_chunked": False, "correct_doc_text": text}
 
     def _create_document_batches(self, docs: List[Dict]) -> List[List[Dict]]:
-        return [docs[i : i + self.batch_size] for i in range(0, len(docs), self.batch_size)]
+        return [docs[i: i + self.batch_size] for i in range(0, len(docs), self.batch_size)]
 
     def _process_document_batch(self, doc_batch: List[Dict]) -> List[Optional[Dict]]:
         local_tokenizer = self._create_worker_tokenizer()
@@ -277,6 +285,9 @@ if __name__ == "__main__":
         force_refresh=False,
         num_workers=16,
         batch_size=50,
+        chunk_overlap=128,
+        use_chunking_threshold=350,
+        min_chunk_tokens=150,
     )
     print(f"Cache stats: {dataset_processor.get_cache_stats()}")
     print(f"Processing stats: {dataset_processor.get_processing_stats()}")

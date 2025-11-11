@@ -4,17 +4,13 @@ import torch.nn.functional as F
 
 
 class TripletLoss(nn.Module):
-    def __init__(self, margin=0.10, distance='cosine', reduction='mean'):
+    def __init__(self, base_margin=0.06, distance='cosine', reduction='mean'):
         super().__init__()
-        self.margin = margin
+        self.base_margin = base_margin
         self.distance = distance
         self.reduction = reduction
 
-    def forward(self, anchor, positive, negative):
-        anchor = F.normalize(anchor, p=2, dim=1)
-        positive = F.normalize(positive, p=2, dim=1)
-        negative = F.normalize(negative, p=2, dim=1)
-
+    def forward(self, anchor, positive, negative, sample_weights=None):
         if self.distance == 'cosine':
             pos_dist = 1 - F.cosine_similarity(anchor, positive)
             neg_dist = 1 - F.cosine_similarity(anchor, negative)
@@ -27,7 +23,14 @@ class TripletLoss(nn.Module):
         else:
             raise ValueError(f"Unknown distance metric: {self.distance}")
 
-        loss = F.relu(pos_dist - neg_dist + self.margin)
+        current_margins = neg_dist - pos_dist
+
+        adaptive_margins = self.base_margin * torch.sigmoid(current_margins * 10)
+
+        loss = F.relu(pos_dist - neg_dist + adaptive_margins)
+
+        if sample_weights is not None:
+            loss = loss * sample_weights
 
         if self.reduction == 'mean':
             return loss.mean()

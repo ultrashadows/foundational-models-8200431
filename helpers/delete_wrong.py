@@ -12,7 +12,7 @@ def fastest_update():
     start_time = time.time()
     collection.update_many(
         {"embedding": {"$exists": True}},
-        {"$unset": {"embedding": ""}},
+        {"$unset": {"wrong": ""}},
         bypass_document_validation=True,
     )
     end_time = time.time()

@@ -3,7 +3,7 @@ import os
 import openai
 from pymongo import MongoClient
 import json
-from embed.helpers import embed
+from helpers import embed
 from dotenv import load_dotenv
 
 load_dotenv()
