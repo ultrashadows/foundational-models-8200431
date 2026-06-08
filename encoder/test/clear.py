@@ -1,7 +1,7 @@
 import json
 
 input_path = "./evaluation/test.json"
-output_path = "./evaluation/clean.json"
+output_path = "../../../law-gpt/services/retrieval-service/scripts/data.json"
 field = "Texto Integral"
 strip_whitespace = True
 preserve_original_order = True
@@ -20,7 +20,7 @@ for i, obj in enumerate(data):
     lengths.append((i, len(text)))
 
 lengths.sort(key=lambda t: (t[1], t[0]))
-middle_indices = [idx for (idx, _) in lengths[350:650]]
+middle_indices = [idx for (idx, _) in lengths[500:1500]]
 
 if preserve_original_order:
     keep = set(middle_indices)

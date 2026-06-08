@@ -153,7 +153,7 @@ def calculate_data_margin(train_loader, model, device, sample_size=1000):
     return suggested_margin, stats
 
 
-def train_distributed(rank, world_size, num_epochs=3):
+def train_distributed(rank, world_size, num_epochs=2):
     torch.cuda.set_device(rank)
     timeout = timedelta(minutes=int(os.environ.get("DDP_TIMEOUT_MIN", "60")))
     dist.init_process_group(backend="nccl", init_method="env://", timeout=timeout)
@@ -165,7 +165,7 @@ def train_distributed(rank, world_size, num_epochs=3):
     configure_gpu_memory()
 
     dataset_name = "dataset_1.json"
-    load_path = "./models/albertina-1b5"
+    load_path = "./models/finetuned-albertina-1b5-100k-triplets"
 
     if rank == 0:
         logger.info(f"Starting training on {dataset_name} for {num_epochs} epochs")
@@ -194,7 +194,7 @@ def train_distributed(rank, world_size, num_epochs=3):
     )
 
     optimizer = torch.optim.AdamW(
-        [{"params": model.parameters(), "weight_decay": 0.01, "lr": 5e-6}],
+        [{"params": model.parameters(), "weight_decay": 0.01, "lr": 2e-6}],
         betas=(0.9, 0.999),
         eps=1e-8,
     )
@@ -328,6 +328,7 @@ def run_training_loop(rank, world_size, model, train_loader, train_sampler,
                 a = {k: v.to(device) for k, v in batch["anchor"].items()}
                 p = {k: v.to(device) for k, v in batch["positive"].items()}
                 n = {k: v.to(device) for k, v in batch["negative"].items()}
+                w = batch["weight"].to(device)
 
                 should_sync = ((i + 1) % accumulation_steps == 0) or ((i + 1) == len(train_loader))
 
@@ -337,7 +338,7 @@ def run_training_loop(rank, world_size, model, train_loader, train_sampler,
                         p["input_ids"], p["attention_mask"],
                         n["input_ids"], n["attention_mask"]
                     )
-                    loss_val = criterion(a_emb, p_emb, n_emb)
+                    loss_val = criterion(a_emb, p_emb, n_emb, sample_weights=w)
 
                     if torch.isnan(loss_val) or torch.isinf(loss_val):
                         if is_main_process:

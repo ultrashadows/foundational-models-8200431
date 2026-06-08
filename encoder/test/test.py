@@ -484,7 +484,7 @@ def main():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-    model_path = "./models/finetuned-albertina-1b5-triplet-loss-dataset-1"
+    model_path = "./models/finetuned-albertina-1b5-100k-triplets"
     eval_dataset_path = "./evaluation/clean.json"
     cache_dir = "./cache"
 
@@ -517,7 +517,6 @@ def main():
         score = results.get(metric, 0.0)
         print(f"{metric:<15} {score:<12.4f}")
 
-    # Base model results for comparison
     base_results = {
         "recall@1": 0.0313,
         "recall@3": 0.0660,
