@@ -1,14 +1,21 @@
+"""Report margin statistics (pos_sim - neg_sim) of a triplet dataset.
+
+Uses the values stored by ``helpers/triplet_generator.py`` and recomputes them on the first 500
+triplets with the generator's embedding model.
+"""
+
+import argparse
 import json
-import torch
+from collections import defaultdict
+from pathlib import Path
+
 import numpy as np
 from sentence_transformers import SentenceTransformer, util
-import matplotlib.pyplot as plt
-from collections import defaultdict
+
+DEFAULT_DATASET = Path(__file__).resolve().parents[1] / "datasets" / "dataset_1.json"
 
 
 def analyze_dataset_margins(dataset_path, model_name="intfloat/multilingual-e5-base"):
-    """Comprehensive analysis of your triplet dataset margins"""
-
     print(f"Analyzing dataset: {dataset_path}")
     print(f"Using model: {model_name}")
 
@@ -79,7 +86,7 @@ def analyze_dataset_margins(dataset_path, model_name="intfloat/multilingual-e5-b
             f"\nStored vs Re-computed margin difference - Mean: {np.mean(margin_diff):.4f}, Std: {np.std(margin_diff):.4f}")
 
     # Distribution analysis
-    print(f"\nRe-computed distribution:")
+    print("\nRe-computed distribution:")
     print(
         f"Margins < 0.05: {sum(1 for m in computed_margins if m < 0.05)} ({sum(1 for m in computed_margins if m < 0.05) / len(computed_margins) * 100:.1f}%)")
     print(
@@ -88,7 +95,7 @@ def analyze_dataset_margins(dataset_path, model_name="intfloat/multilingual-e5-b
         f"Margins > 0.15: {sum(1 for m in computed_margins if m > 0.15)} ({sum(1 for m in computed_margins if m > 0.15) / len(computed_margins) * 100:.1f}%)")
 
     # Problematic triplets
-    print(f"\n=== PROBLEMATIC TRIPLETS ===")
+    print("\n=== PROBLEMATIC TRIPLETS ===")
     negative_margins = [m for m in computed_margins if m < 0]
     if negative_margins:
         print(f"CRITICAL: {len(negative_margins)} triplets have NEGATIVE margins! (pos_sim < neg_sim)")
@@ -110,10 +117,9 @@ def analyze_dataset_margins(dataset_path, model_name="intfloat/multilingual-e5-b
     optimal_margin = np.percentile(computed_margins, 50)  # Median
     conservative_margin = np.percentile(computed_margins, 25)  # 25th percentile
 
-    print(f"\n=== TRAINING RECOMMENDATIONS ===")
+    print("\n=== TRAINING RECOMMENDATIONS ===")
     print(f"Median margin (50th percentile): {optimal_margin:.4f}")
     print(f"Conservative margin (25th percentile): {conservative_margin:.4f}")
-    print(f"Current DEFAULT_MARGIN in your code: 0.2066")
     print(f"RECOMMENDED: Use margin = {conservative_margin:.4f} for training")
 
     if conservative_margin > 0.15:
@@ -130,6 +136,14 @@ def analyze_dataset_margins(dataset_path, model_name="intfloat/multilingual-e5-b
     }
 
 
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)
+    parser.add_argument("--model", default="intfloat/multilingual-e5-base")
+    args = parser.parse_args()
+    results = analyze_dataset_margins(args.dataset, args.model)
+    print(f"Recommended margin: {results['recommended_margin']:.4f}")
+
+
 if __name__ == "__main__":
-    results = analyze_dataset_margins("datasets/dataset_1.json")
-    print(results)
+    main()

@@ -1,14 +1,26 @@
-import os
-import json
-import pickle
-from typing import Dict, List, Optional, Tuple
-from threading import Lock
-from concurrent.futures import ThreadPoolExecutor, as_completed
+"""Split every document of ``encoder/dataset.json`` into token chunks and cache them per document.
 
-import ijson
+Writes ``<cache_dir>/<document _id>.pkl`` with ``correct_chunks``, ``is_chunked`` and
+``correct_doc_text``. ``helpers/triplet_generator.py`` reads these files to pick positives.
+Documents that are already cached are skipped.
+"""
+
+import argparse
+import json
+import os
+import pickle
+import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from threading import Lock
+from typing import Dict, List, Optional
+
 from transformers import AutoTokenizer
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+TOKENIZER_NAME = "PORTULAN/albertina-1b5-portuguese-ptpt-encoder"
+ENCODER_DIR = Path(__file__).resolve().parents[1]
 
 
 class CacheProcessor:
@@ -16,9 +28,6 @@ class CacheProcessor:
             self,
             tokenizer=None,
             max_length=512,
-            split="all",
-            max_samples=None,
-            seed=42,
             json_path="dataset.json",
             cache_dir="cache",
             enable_cache=True,
@@ -29,7 +38,7 @@ class CacheProcessor:
             min_chunk_tokens=150,
             preserve_structure=True,
     ):
-        self.tokenizer = AutoTokenizer.from_pretrained("PORTULAN/albertina-1b5-portuguese-ptpt-encoder") if tokenizer is None else tokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME) if tokenizer is None else tokenizer
         self.max_length = max_length
         self.effective_doc_length = max_length - 20
         self.chunk_overlap = chunk_overlap
@@ -39,9 +48,6 @@ class CacheProcessor:
         self.cache_dir = cache_dir
         self.enable_cache = enable_cache
         self.json_path = json_path
-        self.split = split
-        self.max_samples = max_samples
-        self.seed = seed
         self.num_workers = num_workers
         self.batch_size = batch_size
 
@@ -72,11 +78,7 @@ class CacheProcessor:
             preserve_structure: bool = True,
     ):
         processor = cls(
-            tokenizer=AutoTokenizer.from_pretrained("PORTULAN/albertina-1b5-portuguese-ptpt-encoder"),
             max_length=max_length,
-            split="all",
-            max_samples=None,
-            seed=42,
             json_path=json_path,
             cache_dir=cache_dir,
             enable_cache=True,
@@ -95,14 +97,14 @@ class CacheProcessor:
         return processor
 
     def _create_worker_tokenizer(self):
-        return AutoTokenizer.from_pretrained("PORTULAN/albertina-1b5-portuguese-ptpt-encoder")
+        return AutoTokenizer.from_pretrained(TOKENIZER_NAME)
 
-    def _should_chunk_fast(self, text: str) -> bool:
-        tokens = self.tokenizer.tokenize(text)
+    def _should_chunk_fast(self, text: str, tokenizer) -> bool:
+        tokens = tokenizer.tokenize(text)
         return len(tokens) > self.use_chunking_threshold
 
-    def _tokenize_and_chunk_fast(self, text: str, metadata: str = "") -> List[str]:
-        tokens = self.tokenizer.tokenize(text)
+    def _tokenize_and_chunk_fast(self, text: str, tokenizer, metadata: str = "") -> List[str]:
+        tokens = tokenizer.tokenize(text)
         if len(tokens) <= self.effective_doc_length:
             return [text]
 
@@ -115,7 +117,7 @@ class CacheProcessor:
             chunk_tokens = tokens[start:end]
 
             if len(chunk_tokens) >= self.min_chunk_tokens:
-                chunk_text = self.tokenizer.convert_tokens_to_string(chunk_tokens)
+                chunk_text = tokenizer.convert_tokens_to_string(chunk_tokens)
 
                 if metadata and start == 0:
                     chunk_text = f"{metadata}\n\n{chunk_text}"
@@ -171,13 +173,13 @@ class CacheProcessor:
             parts.append(f"Data: {doc['data']}")
         return " | ".join(parts) if parts else ""
 
-    def _process_positive_only(self, doc: Dict) -> Optional[Dict]:
+    def _process_positive_only(self, doc: Dict, tokenizer) -> Optional[Dict]:
         text = doc.get("Texto Integral", "")
         if not text:
             return None
         metadata = self._extract_document_metadata(doc)
-        if self._should_chunk_fast(text):
-            chunks = self._tokenize_and_chunk_fast(text, metadata)
+        if self._should_chunk_fast(text, tokenizer):
+            chunks = self._tokenize_and_chunk_fast(text, tokenizer, metadata)
             return {"correct_chunks": chunks, "is_chunked": True, "correct_doc_text": text}
         else:
             return {"correct_chunks": [text], "is_chunked": False, "correct_doc_text": text}
@@ -186,36 +188,33 @@ class CacheProcessor:
         return [docs[i: i + self.batch_size] for i in range(0, len(docs), self.batch_size)]
 
     def _process_document_batch(self, doc_batch: List[Dict]) -> List[Optional[Dict]]:
+        # Each worker thread gets its own tokenizer. Fast tokenizers are not safe to share across
+        # threads, and swapping self.tokenizer per thread (the earlier approach) raced.
         local_tokenizer = self._create_worker_tokenizer()
-        original_tokenizer = self.tokenizer
-        self.tokenizer = local_tokenizer
 
         results = []
         local_stats = {"processed": 0, "cache_hits": 0, "new_processed": 0, "errors": 0}
 
-        try:
-            for doc in doc_batch:
-                try:
-                    doc_id = self._extract_id(doc["_id"])
-                    cache_key = self._get_cache_key(doc_id)
-                    if cache_key in self.cached_keys:
-                        local_stats["cache_hits"] += 1
-                        results.append({"cached": True, "doc_id": doc_id})
+        for doc in doc_batch:
+            try:
+                doc_id = self._extract_id(doc["_id"])
+                cache_key = self._get_cache_key(doc_id)
+                if cache_key in self.cached_keys:
+                    local_stats["cache_hits"] += 1
+                    results.append({"cached": True, "doc_id": doc_id})
+                else:
+                    processed = self._process_positive_only(doc, local_tokenizer)
+                    if processed is not None:
+                        with self.cache_lock:
+                            self._save_to_cache(cache_key, processed)
+                        local_stats["new_processed"] += 1
+                        results.append(processed)
                     else:
-                        processed = self._process_positive_only(doc)
-                        if processed is not None:
-                            with self.cache_lock:
-                                self._save_to_cache(cache_key, processed)
-                            local_stats["new_processed"] += 1
-                            results.append(processed)
-                        else:
-                            results.append(None)
-                    local_stats["processed"] += 1
-                except Exception:
-                    local_stats["errors"] += 1
-                    results.append(None)
-        finally:
-            self.tokenizer = original_tokenizer
+                        results.append(None)
+                local_stats["processed"] += 1
+            except Exception:
+                local_stats["errors"] += 1
+                results.append(None)
 
         with self.progress_lock:
             for k, v in local_stats.items():
@@ -255,7 +254,6 @@ class CacheProcessor:
 
     def clear_cache(self):
         if self.enable_cache and os.path.exists(self.cache_dir):
-            import shutil
             shutil.rmtree(self.cache_dir)
             os.makedirs(self.cache_dir, exist_ok=True)
             self.cached_keys.clear()
@@ -271,18 +269,21 @@ class CacheProcessor:
         with self.progress_lock:
             return self.progress_stats.copy()
 
-    def set_num_workers(self, num_workers: int):
-        self.num_workers = max(1, num_workers)
-
-    def set_batch_size(self, batch_size: int):
-        self.batch_size = max(1, batch_size)
 
 
-if __name__ == "__main__":
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dataset", type=Path, default=ENCODER_DIR / "dataset.json")
+    parser.add_argument("--cache-dir", type=Path, default=ENCODER_DIR / "cache")
+    parser.add_argument("--force-refresh", action="store_true", help="delete the cache and rebuild it")
+    args = parser.parse_args()
+    if not args.dataset.is_file():
+        raise SystemExit(f"Dataset not found at {args.dataset}. Export database.encoder there or pass --dataset.")
+
     dataset_processor = CacheProcessor.preprocess_only(
-        json_path="dataset.json",
-        cache_dir="cache",
-        force_refresh=False,
+        json_path=str(args.dataset),
+        cache_dir=str(args.cache_dir),
+        force_refresh=args.force_refresh,
         num_workers=16,
         batch_size=50,
         chunk_overlap=128,
@@ -291,3 +292,7 @@ if __name__ == "__main__":
     )
     print(f"Cache stats: {dataset_processor.get_cache_stats()}")
     print(f"Processing stats: {dataset_processor.get_processing_stats()}")
+
+
+if __name__ == "__main__":
+    main()

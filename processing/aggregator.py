@@ -1,13 +1,21 @@
-from pymongo import MongoClient
+"""Merge every crawled collection in ``files`` into a single ``database.pool`` collection.
+
+The target collection is cleared first. Each copied document gets an ``_origin_collection``
+field with the name of the court collection it came from.
+"""
+
+import logging
+import sys
+import time
+from collections.abc import Generator
+from contextlib import contextmanager
+from typing import Any
+
 from pymongo.errors import BulkWriteError, ConnectionFailure, OperationFailure
 from tqdm import tqdm
-import logging
-import time
-from typing import List, Dict, Any, Generator
-from contextlib import contextmanager
-import sys
 
-MONGO_URI = "mongodb://localhost:27017"
+from db import connect
+
 SOURCE_DB = "files"
 SOURCE_COLLECTIONS = [
     "cajp", "csm", "jcon", "jsta", "jstj", "jtca", "jtcampca", "jtcampct",
@@ -35,9 +43,8 @@ logger = logging.getLogger(__name__)
 def get_mongo_client():
     client = None
     try:
-        client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
-        # Test connection
-        client.admin.command('ismaster')
+        client = connect(serverSelectionTimeoutMS=5000)
+        client.admin.command("ping")
         logger.info("Successfully connected to MongoDB")
         yield client
     except ConnectionFailure as e:
@@ -49,7 +56,7 @@ def get_mongo_client():
             logger.info("MongoDB connection closed")
 
 
-def batch_iterator(cursor, batch_size: int) -> Generator[List[Dict[Any, Any]], None, None]:
+def batch_iterator(cursor, batch_size: int) -> Generator[list[dict[Any, Any]], None, None]:
     try:
         while True:
             batch = []
@@ -76,7 +83,7 @@ def clear_target_collection(target_collection) -> None:
         raise
 
 
-def get_collection_stats(db, collection_name: str) -> Dict[str, Any]:
+def get_collection_stats(db, collection_name: str) -> dict[str, Any]:
     try:
         count = db[collection_name].count_documents({})
         return {"count": count, "exists": True}
@@ -85,7 +92,7 @@ def get_collection_stats(db, collection_name: str) -> Dict[str, Any]:
         return {"count": 0, "exists": False}
 
 
-def insert_batch_with_retry(target_collection, batch: List[Dict], collection_name: str) -> int:
+def insert_batch_with_retry(target_collection, batch: list[dict], collection_name: str) -> int:
     for attempt in range(MAX_RETRIES):
         try:
             result = target_collection.insert_many(batch, ordered=False)

@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the thesis below."
+title: "Foundational Models for the Portuguese Legal Domain (code)"
+type: software
+license: MIT
+repository-code: "https://github.com/ultrashadows/foundational-models-8200431"
+authors:
+  - family-names: Pereira
+    given-names: Pedro
+preferred-citation:
+  type: thesis
+  thesis-type: "Master's thesis"
+  title: "Foundational Models for the Portuguese Legal Domain"
+  authors:
+    - family-names: Pereira
+      given-names: Pedro
+  institution:
+    name: "ESTG"
+  year: 2026

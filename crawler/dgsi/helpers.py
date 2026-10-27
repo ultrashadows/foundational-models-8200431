@@ -1,25 +1,18 @@
 import aiohttp
 from bs4 import BeautifulSoup
-from pymongo import MongoClient
 
 
-# Returns the active MongoDB connection on the given port
-def connect():
-    return MongoClient('localhost', 27017)
-
-
-async def fetch_page(url: str) -> tuple[list[str], str]:
+async def fetch_page(url: str, session: aiohttp.ClientSession) -> tuple[list[str], str | None]:
+    """Return the document links on a DGSI listing page and the link to the next page."""
     urls = []
     next_url = None
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as response:
-            content = await response.text()
-            soup = BeautifulSoup(content, 'html.parser')
-            links = soup.find_all('a')
-            for link in links:
-                if link.text == "Seguinte":
-                    next_url = link.get('href')
-                href = link.get('href')
-                if href and href.endswith("OpenDocument"):
-                    urls.append(href)
+    async with session.get(url) as response:
+        content = await response.text()
+    soup = BeautifulSoup(content, "html.parser")
+    for link in soup.find_all("a"):
+        href = link.get("href")
+        if link.text == "Seguinte":
+            next_url = href
+        if href and href.endswith("OpenDocument"):
+            urls.append(href)
     return urls, next_url

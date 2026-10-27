@@ -1,23 +1,38 @@
+"""Mine (question, positive, negative) triplets for encoder fine-tuning.
+
+Inputs (all under ``encoder/`` by default):
+  dataset.json   documents with generated questions (``results``), exported from ``database.encoder``
+  cache/         per-document chunks written by ``encoder/train/cache_processor.py``
+  pool.json      negative pool documents, exported from ``database.pool``
+
+For every question the positive is the most similar chunk of its own document. The negative is a
+pool chunk chosen so that ``pos_sim - neg_sim`` is close to a target margin, and each pool chunk
+can be used at most ``MAX_CHUNK_USAGE`` times. Output: ``encoder/datasets/dataset_1.json``.
+"""
+
+import argparse
+import gc
 import json
+import logging
 import os
 import pickle
-import argparse
 import random
+import shutil
+import sys
 import time
-import numpy as np
+import traceback
 from collections import defaultdict
-from tqdm import tqdm
-from typing import List, Dict, Tuple, Optional
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import ijson
+import numpy as np
+import psutil
 import torch
 from sentence_transformers import SentenceTransformer, util
-import gc
-import logging
-from concurrent.futures import ThreadPoolExecutor
-import threading
-import psutil
-import sys
+from tqdm import tqdm
 from transformers import AutoTokenizer
-import ijson
 
 
 class ColoredFormatter(logging.Formatter):
@@ -71,36 +86,28 @@ def setup_logging():
 
 logger = setup_logging()
 
-DATASET_PATH = "../encoder/dataset.json"
-CACHE_DIR = "../encoder/cache"
-DATASETS_DIR = "../encoder/datasets"
-POOL_PATH = "../encoder/pool.json"
-POOL_CACHE_DIR = "../encoder/pool_cache"
-TRIPLET_CHECKPOINT_DIR = "../encoder/triplet_checkpoints"
+ENCODER_DIR = Path(__file__).resolve().parents[1] / "encoder"
+DATASET_PATH = str(ENCODER_DIR / "dataset.json")
+CACHE_DIR = str(ENCODER_DIR / "cache")
+DATASETS_DIR = str(ENCODER_DIR / "datasets")
+POOL_PATH = str(ENCODER_DIR / "pool.json")
+POOL_CACHE_DIR = str(ENCODER_DIR / "pool_cache")
+TRIPLET_CHECKPOINT_DIR = str(ENCODER_DIR / "triplet_checkpoints")
+CHUNK_TOKENIZER = "PORTULAN/albertina-1b5-portuguese-ptpt-encoder"
 
-BATCH_SIZE = 64
 QUERY_BATCH_SIZE = 64
 EMBEDDING_BATCH_SIZE = 64
-FIRST_BATCH_SIZE = 125000
-NEXT_BATCH_SIZE = 0
 
-MEMORY_CLEANUP_THRESHOLD = 0.85
-POS_CACHE_MAX_ITEMS = 1000000
-
-MARGIN_START = 0.25
-MARGIN_END = 0.10
-MARGIN_TOL_START = 0.10
-MARGIN_TOL_END = 0.05
+# Negative selection aims for pos_sim - neg_sim within TARGET_MARGIN +/- MARGIN_TOLERANCE.
+TARGET_MARGIN = 0.20
+MARGIN_TOLERANCE = 0.08
 
 MIN_POS_SIM = 0.25
 MIN_MARGIN = 0.12
 MAX_POS_NEG_SIM = 0.88
 MIN_NEG_SIM = 0.20
 TARGET_TRIPLETS = 125000
-OVERLAP_PERCENT = 0.0
 
-NEG_CANDIDATES = 16384
-TOP_K_NEGATIVES = 128
 NUM_WORKERS = 8
 
 MAX_CHUNK_USAGE = 3
@@ -108,14 +115,10 @@ CHUNK_SIZE = 512
 CHUNK_OVERLAP = 128
 MIN_CHUNK_TOKENS = 150
 CHECKPOINT_EVERY = 5000
-SIMILARITY_BATCH_SIZE = 512
 MAX_POOL_SIZE = 2000000
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32
-
-log_lock = threading.Lock()
-
 
 class PerformanceMonitor:
     def __init__(self):
@@ -163,11 +166,6 @@ def aggressive_cleanup():
         torch.cuda.synchronize()
 
 
-def thread_safe_log(msg: str, level: int = logging.INFO):
-    with log_lock:
-        logger.log(level, msg)
-
-
 def ensure_dirs():
     dirs = [DATASETS_DIR, CACHE_DIR, POOL_CACHE_DIR, TRIPLET_CHECKPOINT_DIR]
     for d in dirs:
@@ -179,7 +177,7 @@ def load_pkl_safe(path: str, default=None):
         with open(path, "rb") as f:
             result = pickle.load(f)
         return result
-    except (FileNotFoundError, EOFError, pickle.UnpicklingError) as e:
+    except (FileNotFoundError, EOFError, pickle.UnpicklingError):
         return default
 
 
@@ -276,10 +274,8 @@ class NegativePoolManager:
         monitor.start_stage("pool_building")
 
         if not os.path.exists(self.pool_path):
-            logger.error(f"Pool file not found: {self.pool_path}")
-            self._create_dummy_pool()
-            monitor.end_stage("pool_building")
-            return
+            raise FileNotFoundError(f"Negative pool not found at {self.pool_path} and no pool cache in "
+                                    f"{POOL_CACHE_DIR}. Export database.pool to that path first.")
 
         logger.info("Streaming pool.json with ijson (this may take a few minutes for 7GB file)...")
         all_chunks = []
@@ -300,10 +296,7 @@ class NegativePoolManager:
                     aggressive_cleanup()
 
         if not all_chunks:
-            logger.error("No valid chunks created from pool!")
-            self._create_dummy_pool()
-            monitor.end_stage("pool_building")
-            return
+            raise ValueError(f"No valid chunks were created from {self.pool_path}.")
 
         logger.info(f"Created {len(all_chunks):,} chunks from {doc_count:,} pool documents")
 
@@ -324,7 +317,7 @@ class NegativePoolManager:
                 'texts': all_chunks
             }, metadata_path)
 
-            logger.info(f"Pool cache saved successfully")
+            logger.info("Pool cache saved successfully")
         except Exception as e:
             logger.warning(f"Failed to save cache: {e}")
 
@@ -380,10 +373,7 @@ class NegativePoolManager:
                 continue
 
         if not all_embeddings:
-            logger.error("No shards loaded successfully!")
-            self._create_dummy_pool()
-            monitor.end_stage("loading_sharded_pool")
-            return
+            raise ValueError(f"No pool shards could be loaded from {POOL_CACHE_DIR}.")
 
         logger.info(f"Concatenating {len(all_embeddings)} shards...")
         embeddings = torch.cat(all_embeddings, dim=0)
@@ -436,13 +426,6 @@ class NegativePoolManager:
 
         return torch.cat(embeddings, dim=0)
 
-    def _create_dummy_pool(self):
-        logger.warning("Creating dummy negative pool")
-        dim = 768
-        self.global_neg_pool = torch.randn(1000, dim, dtype=DTYPE, device=DEVICE)
-        self.global_neg_texts = [f"dummy_text_{i}" for i in range(1000)]
-        self.chunk_usage_counts = [0] * 1000
-
     def get_available_indices(self) -> torch.Tensor:
         available = [i for i, count in enumerate(self.chunk_usage_counts) if count < MAX_CHUNK_USAGE]
         return torch.tensor(available, dtype=torch.long)
@@ -470,12 +453,8 @@ class FastDatasetProcessor:
     def __init__(self, model: SentenceTransformer, pool_manager: NegativePoolManager):
         self.model = model
         self.pool_manager = pool_manager
-        self.pos_embeddings_cache = {}
-        self.processed_queries = 0
-        self.generated_triplets = 0
 
-    def encode_batch_optimized(self, texts: List[str], desc: str,
-                               batch_size: int = None) -> torch.Tensor:
+    def encode_batch_optimized(self, texts: List[str], batch_size: int = None) -> torch.Tensor:
         if not texts:
             dim = self.model.get_sentence_embedding_dimension()
             return torch.empty(0, dim, dtype=DTYPE, device=DEVICE)
@@ -514,10 +493,6 @@ class FastDatasetProcessor:
                                         pos_sims: List[float],
                                         target_margin: float,
                                         tolerance: float) -> List[Tuple[str, float, str, int]]:
-
-        if self.pool_manager.global_neg_pool is None:
-            logger.error("No global negative pool available!")
-            return [("fallback_negative", 0.0, "emergency", -1)] * len(pos_sims)
 
         available_indices = self.pool_manager.get_available_indices()
 
@@ -669,9 +644,8 @@ class FastDatasetProcessor:
 
         return triplets, checkpoint_num
 
-    def process_dataset_batch(self, documents: List[Dict],
-                              dataset_idx: int, total_datasets: int) -> List[Dict]:
-        logger.info(f"Processing dataset with {len(documents):,} docs for 125K triplets")
+    def process_dataset_batch(self, documents: List[Dict]) -> List[Dict]:
+        logger.info(f"Processing dataset with {len(documents):,} docs for {TARGET_TRIPLETS:,} triplets")
 
         all_triplets, last_checkpoint = self.load_latest_checkpoint()
 
@@ -741,14 +715,14 @@ class FastDatasetProcessor:
 
             logger.info("Encoding queries...")
             query_texts = [f"query: {rec['query']}" for rec in batch_records]
-            query_embeddings = self.encode_batch_optimized(query_texts, f"queries", QUERY_BATCH_SIZE)
+            query_embeddings = self.encode_batch_optimized(query_texts, QUERY_BATCH_SIZE)
             logger.info(f"Encoded {len(query_embeddings)} query embeddings")
 
-            target_margin, tolerance, difficulty = self._get_curriculum_params(dataset_idx, total_datasets)
+            target_margin, tolerance = TARGET_MARGIN, MARGIN_TOLERANCE
 
             logger.info(f"Generating triplets (margin={target_margin:.2f}±{tolerance:.2f})...")
             batch_triplets = self._generate_triplets_batch_guaranteed(
-                batch_records, query_embeddings, target_margin, tolerance, difficulty
+                batch_records, query_embeddings, target_margin, tolerance
             )
 
             all_triplets.extend(batch_triplets)
@@ -774,7 +748,7 @@ class FastDatasetProcessor:
             random.shuffle(all_triplets)
 
         logger.info("Saving final dataset...")
-        output_file = os.path.join(DATASETS_DIR, f"dataset_1.json")
+        output_file = os.path.join(DATASETS_DIR, "dataset_1.json")
         with open(output_file, "w", encoding="utf-8") as f:
             json.dump(all_triplets, f, ensure_ascii=False, indent=2)
 
@@ -793,7 +767,7 @@ class FastDatasetProcessor:
             if "neg_sim" in t:
                 neg_sims.append(t["neg_sim"])
 
-        logger.info(f"Dataset Summary:")
+        logger.info("Dataset Summary:")
         logger.info(f"  Total triplets: {len(all_triplets):,}")
         logger.info(f"  Triplet types: {dict(type_counts)}")
 
@@ -814,17 +788,9 @@ class FastDatasetProcessor:
         cache_path = os.path.join(CACHE_DIR, f"{oid}.pkl")
         return load_pkl_safe(cache_path, {})
 
-    def _get_curriculum_params(self, dataset_idx: int, total_datasets: int) -> Tuple[float, float, float]:
-        margin = 0.20
-        tolerance = 0.08
-        difficulty = 0.6
-
-        return float(margin), float(tolerance), float(difficulty)
-
     def _generate_triplets_batch_guaranteed(self, records: List[Dict],
                                             query_embeddings: torch.Tensor,
-                                            target_margin: float, tolerance: float,
-                                            difficulty: float) -> List[Dict]:
+                                            target_margin: float, tolerance: float) -> List[Dict]:
         triplets = []
         batch_size = 128
 
@@ -886,34 +852,16 @@ class FastDatasetProcessor:
                                          records: List[Dict]) -> List[Optional[Tuple[str, float]]]:
         results = []
 
-        all_pos_texts = []
-        record_indices = []
-        text_to_record = []
-
-        for i, record in enumerate(records):
-            correct_chunks = record["correct_chunks"]
-            if not correct_chunks:
-                results.append((f"Fallback positive for {record['query'][:50]}", 0.6))
-                continue
-
-            start_idx = len(all_pos_texts)
-            pos_texts = [f"passage: {chunk}" for chunk in correct_chunks]
-            all_pos_texts.extend(pos_texts)
-
-            for j in range(len(pos_texts)):
-                record_indices.append(i)
-                text_to_record.append((i, correct_chunks[j]))
+        # Records always have chunks (process_dataset_batch drops those without).
+        all_pos_texts = [f"passage: {chunk}" for record in records for chunk in record["correct_chunks"]]
 
         if not all_pos_texts:
             return results
 
-        pos_embs = self.encode_batch_optimized(all_pos_texts, "positives", EMBEDDING_BATCH_SIZE)
+        pos_embs = self.encode_batch_optimized(all_pos_texts, EMBEDDING_BATCH_SIZE)
 
         emb_idx = 0
         for i, record in enumerate(records):
-            if i < len(results):
-                continue
-
             correct_chunks = record["correct_chunks"]
             num_chunks = len(correct_chunks)
 
@@ -935,6 +883,8 @@ class FastDatasetProcessor:
                 results.append((best_text, best_sim))
                 monitor.increment("positive_matches")
             else:
+                # The stored pos_sim is raised to MIN_POS_SIM + 0.1 here, so it is not always the
+                # measured similarity. Kept as in the thesis runs.
                 best_text = correct_chunks[0]
                 boosted_sim = max(best_sim, MIN_POS_SIM + 0.1)
                 results.append((best_text, boosted_sim))
@@ -966,13 +916,12 @@ def load_model_optimized(model_name: str) -> SentenceTransformer:
 
 
 def main(args):
-    logger.info("Starting Optimized Triplet Mining for 125K Triplets with Sharded Pool")
+    logger.info(f"Starting triplet mining for {TARGET_TRIPLETS:,} triplets")
     logger.info(f"   Device: {DEVICE} ({DTYPE})")
     logger.info(f"   Target: {TARGET_TRIPLETS:,} triplets in single dataset")
     logger.info(f"   Max chunk usage: {MAX_CHUNK_USAGE}")
     logger.info(f"   Chunk size: {CHUNK_SIZE}, Overlap: {CHUNK_OVERLAP}")
     logger.info(f"   Checkpoint every: {CHECKPOINT_EVERY:,} triplets")
-    logger.info(f"   Similarity batch size: {SIMILARITY_BATCH_SIZE:,}")
 
     random.seed(42)
     torch.manual_seed(42)
@@ -984,7 +933,7 @@ def main(args):
     model = load_model_optimized(args.model)
 
     logger.info("Loading tokenizer for chunking...")
-    tokenizer = AutoTokenizer.from_pretrained("PORTULAN/albertina-1b5-portuguese-ptpt-encoder")
+    tokenizer = AutoTokenizer.from_pretrained(CHUNK_TOKENIZER)
 
     logger.info("Initializing negative pool manager...")
     pool_manager = NegativePoolManager(POOL_PATH, model, tokenizer)
@@ -1002,8 +951,8 @@ def main(args):
     logger.info(f"Loaded {len(all_docs):,} documents")
     monitor.end_stage("dataset_loading")
 
-    logger.info("Processing all documents to generate 125K triplets...")
-    triplets = processor.process_dataset_batch(all_docs, 1, 1)
+    logger.info(f"Processing all documents to generate {TARGET_TRIPLETS:,} triplets...")
+    triplets = processor.process_dataset_batch(all_docs)
 
     logger.info(f"Successfully generated {len(triplets):,} triplets!")
     logger.info(f"Saved to {os.path.join(DATASETS_DIR, 'dataset_1.json')}")
@@ -1012,7 +961,7 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Optimized Triplet Mining with Sharded Pool")
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--model", type=str, default="intfloat/multilingual-e5-base",
                         help="SentenceTransformer model name")
     parser.add_argument("--target-triplets", type=int, default=TARGET_TRIPLETS,
@@ -1021,8 +970,6 @@ if __name__ == "__main__":
                         help="Batch size for embedding generation")
     parser.add_argument("--query-batch-size", type=int, default=QUERY_BATCH_SIZE,
                         help="Batch size for query processing")
-    parser.add_argument("--neg-candidates", type=int, default=NEG_CANDIDATES,
-                        help="Number of negative candidates to sample")
     parser.add_argument("--max-chunk-usage", type=int, default=MAX_CHUNK_USAGE,
                         help="Maximum times a chunk can be used as negative")
     parser.add_argument("--chunk-size", type=int, default=CHUNK_SIZE,
@@ -1031,12 +978,10 @@ if __name__ == "__main__":
                         help="Overlap between chunks")
     parser.add_argument("--checkpoint-every", type=int, default=CHECKPOINT_EVERY,
                         help="Save checkpoint every N triplets")
-    parser.add_argument("--similarity-batch", type=int, default=SIMILARITY_BATCH_SIZE,
-                        help="Batch size for similarity computation")
     parser.add_argument("--memory-aggressive", action="store_true",
                         help="Enable aggressive memory management")
     parser.add_argument("--rebuild-pool", action="store_true",
-                        help="Force rebuild of pool cache")
+                        help="Delete the single-file pool cache so it is rebuilt (a sharded cache is not touched)")
     parser.add_argument("--clear-checkpoints", action="store_true",
                         help="Clear existing checkpoints and start fresh")
     parser.add_argument("--debug", action="store_true",
@@ -1051,19 +996,15 @@ if __name__ == "__main__":
     TARGET_TRIPLETS = args.target_triplets
     EMBEDDING_BATCH_SIZE = args.embedding_batch_size
     QUERY_BATCH_SIZE = args.query_batch_size
-    NEG_CANDIDATES = args.neg_candidates
     MAX_CHUNK_USAGE = args.max_chunk_usage
     CHUNK_SIZE = args.chunk_size
     CHUNK_OVERLAP = args.chunk_overlap
     CHECKPOINT_EVERY = args.checkpoint_every
-    SIMILARITY_BATCH_SIZE = args.similarity_batch
 
     if args.clear_checkpoints:
-        import shutil
-
         if os.path.exists(TRIPLET_CHECKPOINT_DIR):
             shutil.rmtree(TRIPLET_CHECKPOINT_DIR)
-            logger.info(f"Cleared checkpoint directory")
+            logger.info("Cleared checkpoint directory")
         ensure_dirs()
 
     if args.rebuild_pool:
@@ -1079,7 +1020,6 @@ if __name__ == "__main__":
     if args.memory_aggressive:
         EMBEDDING_BATCH_SIZE = max(32, EMBEDDING_BATCH_SIZE // 2)
         QUERY_BATCH_SIZE = max(32, QUERY_BATCH_SIZE // 2)
-        SIMILARITY_BATCH_SIZE = max(512, SIMILARITY_BATCH_SIZE // 2)
         logger.info("Aggressive memory mode enabled - reduced batch sizes")
 
     try:
@@ -1090,8 +1030,6 @@ if __name__ == "__main__":
         monitor.log_summary()
     except Exception as e:
         logger.error(f"Fatal error: {e}")
-        import traceback
-
         logger.error(traceback.format_exc())
         raise
     finally:

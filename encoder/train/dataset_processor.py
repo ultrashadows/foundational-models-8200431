@@ -1,18 +1,31 @@
-import os
 import json
+import os
 import random
+
 import torch
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
 
 class DatasetProcessor(Dataset):
-    def __init__(self, tokenizer, split, max_length, dataset, hard_negatives=False,
-                 hard_negative_ratio=0.35, semi_hard_ratio=0.45, easy_ratio=0.10, random_neg_ratio=0.10):
-        assert split in {"train", "test"}
+    """Triplet dataset read from the JSON written by ``helpers/triplet_generator.py``.
+
+    The first 90% of the file is the train split and the rest is the test split. The train split
+    is shuffled with a fixed seed so that every DDP rank (and every run) sees the same order,
+    which DistributedSampler and the hard-negative cache both rely on.
+    """
+
+    def __init__(self, tokenizer, split, max_length, dataset_path, hard_negatives=False,
+                 hard_negative_ratio=0.35, semi_hard_ratio=0.45, easy_ratio=0.10, random_neg_ratio=0.10,
+                 seed=42):
+        if split not in {"train", "test"}:
+            raise ValueError(f"split must be 'train' or 'test', got {split!r}")
+        if not os.path.isfile(dataset_path):
+            raise FileNotFoundError(f"Triplet dataset not found at {dataset_path}. "
+                                    "Generate it with helpers/triplet_generator.py or pass --dataset.")
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.dataset_path = os.path.join("datasets", dataset)
+        self.dataset_path = str(dataset_path)
         self.hard_negatives = hard_negatives
 
         self.hard_negative_ratio = hard_negative_ratio
@@ -39,7 +52,7 @@ class DatasetProcessor(Dataset):
         self.difficulty_weights = None
 
         if split == "train":
-            random.shuffle(self.samples)
+            random.Random(seed).shuffle(self.samples)
             print(f"Loaded {len(self.samples):,} training samples")
 
     def __len__(self):
@@ -61,6 +74,8 @@ class DatasetProcessor(Dataset):
             negative_text = self.hard_negative_texts[idx]
         elif self.hard_negatives and self.easy_negative_texts and rand < cumulative_easy:
             negative_text = self.easy_negative_texts[idx]
+        # With the default ratios this bound is 1.0, so this branch always runs and the mined
+        # negative below is unreachable. The thesis models were trained this way (see README).
         elif rand < cumulative_easy + self.random_neg_ratio:
             negative_text = random.choice(self.negative_pool)
         else:
@@ -136,15 +151,15 @@ class DatasetProcessor(Dataset):
     def precompute_hard_negatives(self, model, tokenizer, device):
         cache_path = self.dataset_path.replace(".json", "_hardcache.pt")
         if os.path.exists(cache_path):
-            cache = torch.load(cache_path)
+            cache = torch.load(cache_path, weights_only=True)
             self.hard_negative_texts = cache['hard']
             self.semi_hard_negative_texts = cache['semi']
             self.easy_negative_texts = cache.get('easy', cache['semi'])
             self.difficulty_weights = cache['weights']
-            print(f"Loaded hard negatives from cache")
+            print("Loaded hard negatives from cache")
             return
 
-        print("Computing hard negatives for 100K dataset...")
+        print(f"Computing hard negatives for {len(self.samples):,} samples...")
         anchors = [s["question"] for s in self.samples]
         positives = [s["positive"] for s in self.samples]
 

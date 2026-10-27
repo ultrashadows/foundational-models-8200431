@@ -1,7 +1,15 @@
+"""Store a sentence embedding in every ``database.encoder`` document that does not have one yet.
+
+Despite the file name, this script only computes embeddings. ``helpers/embed.py`` uses them to
+pick the most distant document.
+"""
+
 import numpy as np
-from pymongo import MongoClient, UpdateOne, WriteConcern
-from tqdm import tqdm
+from pymongo import UpdateOne, WriteConcern
 from sentence_transformers import SentenceTransformer
+from tqdm import tqdm
+
+from db import connect
 
 
 def ensure_embeddings(col, text_field="Texto Integral", batch_fetch=20000, encode_bs=256):
@@ -36,7 +44,4 @@ def ensure_embeddings(col, text_field="Texto Integral", batch_fetch=20000, encod
 
 
 if __name__ == '__main__':
-    client = MongoClient("mongodb://localhost:27017/")
-    db = client["database"]
-    col = db["encoder"]
-    ensure_embeddings(col)
+    ensure_embeddings(connect()["database"]["encoder"])

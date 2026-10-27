@@ -1,7 +1,14 @@
-import logging
-from pymongo import MongoClient
+"""Build and normalise the ``database.encoder`` collection of documents with generated questions.
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+``add`` replaces the collection with every ``files.jsta`` and ``files.stj`` document that has both
+``results`` and ``wrong``. ``standardize`` renames the keys of each ``results`` item to
+``pergunta``/``resposta`` and unwraps ``results`` objects that hold a single list.
+"""
+
+import argparse
+import logging
+
+from db import connect
 
 
 def fetch_filtered_data(collection):
@@ -10,7 +17,7 @@ def fetch_filtered_data(collection):
 
 def add_to_database():
     logging.info("Connecting to MongoDB...")
-    client = MongoClient("mongodb://localhost:27017/")
+    client = connect()
 
     input_db = client["files"]
     output_db = client["database"]
@@ -36,12 +43,10 @@ def add_to_database():
 
 def standardize_results():
     logging.info("Connecting to MongoDB...")
-    client = MongoClient("mongodb://localhost:27017/")
-    database = client["database"]
-    collection = database["encoder"]
+    collection = connect()["database"]["encoder"]
 
     logging.info(f"Fetching documents from '{collection.name}' collection...")
-    files = list(collection.aggregate([]))
+    files = list(collection.find({}))
 
     if not files:
         logging.warning("No documents found in the collection. Skipping standardization.")
@@ -92,4 +97,16 @@ def standardize_results():
     logging.info("Standardization process completed.")
 
 
-standardize_results()
+def main():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("step", choices=["add", "standardize"])
+    step = parser.parse_args().step
+    if step == "add":
+        add_to_database()
+    else:
+        standardize_results()
+
+
+if __name__ == "__main__":
+    main()

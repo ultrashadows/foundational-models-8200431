@@ -1,0 +1,13 @@
+# Tool configuration only. The project is not packaged. Run modules from the repository root
+# with `python -m <module>` so that absolute imports such as `from db import connect` resolve.
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E9", "F", "I"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

@@ -174,3 +174,60 @@ poetry.toml
 pyrightconfig.json
 
 # End of https://www.toptal.com/developers/gitignore/api/python
+### Project ###
+# IDE settings
+.idea/
+.vscode/
+
+# Large data, caches and model artifacts (see README "Data" and "Models")
+encoder/dataset.json
+encoder/pool.json
+encoder/datasets/
+encoder/cache/
+encoder/pool_cache/
+encoder/triplet_checkpoints/
+encoder/models/
+encoder/results/
+encoder/runs/
+encoder/test/evaluation/*.json
+
+# Generated OpenAI batch input (the prompt is kept in question_generation/prompt.txt)
+question_generation/requests.jsonl
+
+# Local secrets and keys (.env itself is ignored above). Keep only the template.
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+id_rsa*
+id_ed25519*
+credentials*.json
+service-account*.json
+
+# Model weights, tensors, caches and data dumps, wherever they end up
+*.pt
+*.pth
+*.bin
+*.ckpt
+*.safetensors
+*.onnx
+*.pkl
+*.npy
+*.npz
+*.parquet
+*.jsonl
+*.bson
+dump/
+
+# Run outputs
+runs/
+wandb/
+events.out.tfevents.*
+
+# OS and editor clutter
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*~

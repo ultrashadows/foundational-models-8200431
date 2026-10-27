@@ -1,102 +1,71 @@
+"""Crawl the PGR legal opinions (ministeriopublico.pt/pareceres-pgr) into MongoDB ``files.pgr``."""
+
+import argparse
 import asyncio
-import json
+
 import aiohttp
 from bs4 import BeautifulSoup
-from crawler.dgsi.helpers import connect
+
+from db import connect
+
+BASE_URL = "https://ministeriopublico.pt"
+SECTIONS = ["paragraph-administrativos", "paragraph-descritores", "paragraph-texto", "paragraph-anotacoes"]
 
 
-async def fetch_document(url):
+def parse_document(html: str, url: str = "") -> dict[str, str]:
+    data = {}
+    soup = BeautifulSoup(html, "html.parser")
+    for section_id in SECTIONS:
+        section = soup.find(id=section_id)
+        if not section:
+            print(f"No {section_id} found on url {url}")
+            continue
+        for field in section.find_all("div", class_="field"):
+            label = field.find("div", class_="field__label").get_text(strip=True)
+            data[label] = field.find("div", class_="field__value").get_text(strip=True, separator=", ")
+    return data
+
+
+async def fetch_document(url: str) -> dict[str, str] | None:
+    # TLS verification is disabled because the site's certificate chain did not validate.
     async with aiohttp.ClientSession() as session:
         async with session.get(url, ssl=False) as response:
-            if response.status == 200:
-                html = await response.text()
-                soup = BeautifulSoup(html, 'html.parser')
-
-                data = {}
-
-                paragraph_administrativos = soup.find(id="paragraph-administrativos")
-                if paragraph_administrativos:
-                    fields = paragraph_administrativos.find_all('div', class_='field')
-
-                    for field in fields:
-                        label = field.find('div', class_='field__label').get_text(strip=True)
-                        value = field.find('div', class_='field__value').get_text(strip=True, separator=', ')
-                        data[label] = value
-                else:
-                    print(f"No paragraph-administrativos found on url {url}")
-
-                paragraph_descritores = soup.find(id="paragraph-descritores")
-                if paragraph_descritores:
-                    fields = paragraph_descritores.find_all('div', class_='field')
-
-                    for field in fields:
-                        label = field.find('div', class_='field__label').get_text(strip=True)
-                        value = field.find('div', class_='field__value').get_text(strip=True, separator=', ')
-                        data[label] = value
-                else:
-                    print(f"No paragraph-descritores found on url {url}")
-
-                paragraph_texto = soup.find(id="paragraph-texto")
-                if paragraph_texto:
-                    fields = paragraph_texto.find_all('div', class_='field')
-
-                    for field in fields:
-                        label = field.find('div', class_='field__label').get_text(strip=True)
-                        value = field.find('div', class_='field__value').get_text(strip=True, separator=', ')
-                        data[label] = value
-                else:
-                    print(f"No paragraph-texto found on url {url}")
-
-                paragraph_anotacoes = soup.find(id="paragraph-anotacoes")
-                if paragraph_anotacoes:
-                    fields = paragraph_anotacoes.find_all('div', class_='field')
-
-                    for field in fields:
-                        label = field.find('div', class_='field__label').get_text(strip=True)
-                        value = field.find('div', class_='field__value').get_text(strip=True, separator=', ')
-                        data[label] = value
-                else:
-                    print(f"No paragraph-anotacoes found on url {url}")
-
-                json_data = json.dumps(data, indent=4, ensure_ascii=False)
-                return json.loads(json_data)
+            if response.status != 200:
+                return None
+            return parse_document(await response.text(), url)
 
 
-async def fetch_documents(page=0):
-    all_documents = []
+async def fetch_documents(page: int) -> None:
     collection = connect().files.pgr
 
     while True:
-        url = f"https://ministeriopublico.pt/pareceres-pgr?page={page}"
+        url = f"{BASE_URL}/pareceres-pgr?page={page}"
         print(url)
         async with aiohttp.ClientSession() as session:
             async with session.get(url, ssl=False) as response:
-                html_content = await response.text()
-                soup = BeautifulSoup(html_content, 'html.parser')
+                soup = BeautifulSoup(await response.text(), "html.parser")
 
-                rows = soup.find_all(class_=['odd', 'even'])
-                pgr_links = []
-                if rows:
-                    for row in rows:
-                        a_tag = row.find('a', href=True)
-                        if a_tag:
-                            pgr_links.append(a_tag['href'])
-                    tasks = [fetch_document(f'https://ministeriopublico.pt{pgr}') for pgr in pgr_links]
-                    results = await asyncio.gather(*tasks)
+        rows = soup.find_all(class_=["odd", "even"])
+        if not rows:
+            print(f"No rows found on page {page}")
+            break
 
-                    all_documents.extend([result for result in results if result])
+        links = [a["href"] for row in rows if (a := row.find("a", href=True))]
+        documents = [doc for doc in await asyncio.gather(*(fetch_document(BASE_URL + link) for link in links)) if doc]
 
-                    if not all_documents:
-                        print(f"No more documents to fetch. Retrying...")
-                    else:
-                        collection.insert_many(all_documents)
-                        print(f"{page} - Inserted {len(all_documents)} documents into MongoDB.")
-                        all_documents = []
-                        page += 1
-                else:
-                    print(f"No rows found on page {page}")
-                    break
+        if not documents:
+            print("No documents fetched from this page. Retrying...")
+        else:
+            collection.insert_many(documents)
+            print(f"{page} - Inserted {len(documents)} documents into MongoDB.")
+            page += 1
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--start-page", type=int, default=0, help="first listing page (0-based)")
+    asyncio.run(fetch_documents(parser.parse_args().start_page))
 
 
 if __name__ == "__main__":
-    asyncio.run(fetch_documents(page=1))
+    main()

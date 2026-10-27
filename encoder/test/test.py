@@ -1,17 +1,31 @@
+"""Retrieval evaluation (recall@k and MRR) of an encoder on question-to-document search.
+
+Every generated question (``results[].pergunta``) is a query and its source decision is the only
+relevant document. Long documents are split into overlapping chunks, embedded with the chosen
+pooling, and averaged into one vector per document.
+"""
+
+import argparse
+import hashlib
 import json
+import logging
 import os
+import pickle
+import time
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+import numpy as np
 import torch
 import torch.nn.functional as F
-import numpy as np
-from typing import List, Dict, Tuple
 from tqdm import tqdm
-from transformers import AutoTokenizer, AutoModel
-import logging
-import time
-import pickle
+from transformers import AutoModel, AutoTokenizer
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+HERE = Path(__file__).resolve().parent
+ENCODER_DIR = HERE.parent
 
 
 class IREvaluator:
@@ -31,8 +45,12 @@ class IREvaluator:
         self.tokenizer = None
         self.hidden_size = None
         self.load_model(model_path)
-        os.makedirs(cache_dir, exist_ok=True)
-        self.embeddings_cache_dir = os.path.join(cache_dir, "embeddings")
+        # Document embeddings depend on the model and on how documents are chunked and pooled,
+        # so the cache is split per configuration. A single shared folder would silently reuse
+        # one model's embeddings when evaluating another.
+        config_key = f"{model_path}|{pooling}|{chunk_size}|{overlap}|{max_chunks_per_doc}|{min_overlap}"
+        config_dir = f"{os.path.basename(os.path.normpath(model_path))}-{hashlib.sha1(config_key.encode()).hexdigest()[:10]}"
+        self.embeddings_cache_dir = os.path.join(cache_dir, "embeddings", config_dir)
         os.makedirs(self.embeddings_cache_dir, exist_ok=True)
 
     def load_model(self, model_path: str):
@@ -66,7 +84,6 @@ class IREvaluator:
         # Load model with safetensors support
         self.model = AutoModel.from_pretrained(
             model_path,
-            trust_remote_code=True,
             local_files_only=os.path.isdir(model_path)
         ).to(self.device)
 
@@ -277,6 +294,7 @@ class IREvaluator:
         doc_id_to_text = {}
         all_doc_texts = []
         all_doc_oids = []
+        seen_texts = set()
 
         for doc in tqdm(eval_data, desc="Processing test documents"):
             doc_id = doc["_id"]["$oid"]
@@ -303,7 +321,8 @@ class IREvaluator:
                 continue
 
             doc_id_to_text[doc_id] = doc_text
-            if doc_text not in all_doc_texts:
+            if doc_text not in seen_texts:
+                seen_texts.add(doc_text)
                 all_doc_texts.append(doc_text)
                 all_doc_oids.append(doc_id)
 
@@ -322,40 +341,21 @@ class IREvaluator:
                              k_max: int, correct_idx: int) -> Tuple[List[int], List[float], float, int]:
         q_dev = query_vec.to(self.device, non_blocking=True)
 
-        # Since embeddings are normalized, use dot product (equivalent to cosine similarity)
-        correct_sim = float(torch.dot(query_vec.float().cpu(), doc_embs_cpu[correct_idx].float()))
-
-        top_scores = None
-        top_indices = None
-        greater_count = 0
-
+        # Embeddings are normalised, so the dot product is the cosine similarity. Document blocks
+        # are moved to the device one at a time to bound memory. The rank is computed from the
+        # same scores as the top-k, so the correct document is never compared against a score
+        # computed at a different precision.
+        blocks = []
         for start in range(0, doc_embs_cpu.size(0), self.sim_block_docs):
-            end = min(start + self.sim_block_docs, doc_embs_cpu.size(0))
-            block = doc_embs_cpu[start:end].to(self.device, non_blocking=True)
-
+            block = doc_embs_cpu[start:start + self.sim_block_docs].to(self.device, non_blocking=True)
             with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
-                sims = torch.matmul(q_dev.unsqueeze(0), block.T).squeeze(0).float()
+                blocks.append(torch.matmul(q_dev.unsqueeze(0), block.T).squeeze(0).float())
+        sims = torch.cat(blocks)
 
-            if top_scores is None:
-                vals, idxs = torch.topk(sims, k=min(k_max, sims.numel()))
-                top_scores = vals
-                top_indices = idxs + start
-            else:
-                cat_scores = torch.cat([top_scores, sims], dim=0)
-                extra_idx = torch.arange(start, end, device=sims.device, dtype=torch.long)
-                cat_indices = torch.cat([top_indices, extra_idx], dim=0)
-                vals, idxs = torch.topk(cat_scores, k=min(k_max, cat_scores.numel()))
-                top_scores = vals
-                top_indices = cat_indices[idxs]
-
-            greater_count += int((sims > correct_sim).sum().item())
-            del block, sims
-            torch.cuda.empty_cache()
-
-        rank = greater_count + 1
-        top_indices_list = top_indices.cpu().tolist()
-        top_scores_list = [float(x) for x in top_scores.cpu()]
-        return top_indices_list, top_scores_list, correct_sim, rank
+        correct_sim = float(sims[correct_idx])
+        top_scores, top_indices = torch.topk(sims, k=min(k_max, sims.numel()))
+        rank = int((sims > sims[correct_idx]).sum().item()) + 1
+        return top_indices.cpu().tolist(), [float(x) for x in top_scores.cpu()], correct_sim, rank
 
     def evaluate_retrieval(self, queries: List[str], documents: List[str],
                            correct_doc_ids: List[str], doc_id_to_text: Dict[str, str],
@@ -471,7 +471,7 @@ def compare_models(base_results: Dict, finetuned_results: Dict):
 
         if base_score > 0:
             improvement = ((ft_score - base_score) / base_score) * 100
-            improvement_str = f"+{improvement:.1f}%"
+            improvement_str = f"{improvement:+.1f}%"
         else:
             improvement_str = "N/A"
 
@@ -479,14 +479,32 @@ def compare_models(base_results: Dict, finetuned_results: Dict):
     print("=" * 70)
 
 
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--model", default=str(ENCODER_DIR / "models" / "finetuned-albertina-1b5-100k-triplets"),
+                        help="model directory or Hugging Face id to evaluate")
+    parser.add_argument("--eval-data", type=Path, default=HERE / "evaluation" / "clean.json",
+                        help="evaluation documents (MongoDB extended JSON with results)")
+    parser.add_argument("--cache-dir", type=Path, default=ENCODER_DIR / "cache",
+                        help="document cache from cache_processor, also used for embedding caches")
+    parser.add_argument("--output", type=Path, default=HERE / "finetuned_evaluation_results.json")
+    return parser.parse_args(argv)
+
+
 def main():
+    args = parse_args()
+    if not torch.cuda.is_available():
+        raise SystemExit("Evaluation requires a CUDA GPU. No GPU was found.")
+    if not args.eval_data.is_file():
+        raise SystemExit(f"Evaluation data not found at {args.eval_data}. Pass --eval-data.")
+
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-    model_path = "./models/finetuned-albertina-1b5-100k-triplets"
-    eval_dataset_path = "./evaluation/clean.json"
-    cache_dir = "./cache"
+    model_path = args.model
+    eval_dataset_path = str(args.eval_data)
+    cache_dir = str(args.cache_dir)
 
     logger.info("Initializing model evaluator...")
     evaluator = IREvaluator(
@@ -517,6 +535,8 @@ def main():
         score = results.get(metric, 0.0)
         print(f"{metric:<15} {score:<12.4f}")
 
+    # Reference scores for the base model, hard-coded in the original script. The run that
+    # produced them is not recorded in the repository.
     base_results = {
         "recall@1": 0.0313,
         "recall@3": 0.0660,
@@ -554,10 +574,10 @@ def main():
         }
     }
 
-    with open("finetuned_evaluation_results.json", "w", encoding="utf-8") as f:
+    with open(args.output, "w", encoding="utf-8") as f:
         json.dump(results_summary, f, ensure_ascii=False, indent=2)
 
-    logger.info("Evaluation complete! Results saved to finetuned_evaluation_results.json")
+    logger.info(f"Evaluation complete! Results saved to {args.output}")
 
 
 if __name__ == "__main__":

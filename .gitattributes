@@ -1,0 +1,8 @@
+# Store text with LF line endings in the repository, whatever the local platform.
+* text=auto eol=lf
+
+*.pt binary
+*.pth binary
+*.pkl binary
+*.npy binary
+*.safetensors binary
